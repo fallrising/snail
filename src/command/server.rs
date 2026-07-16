@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::command::COMMAND_TABLE;
+use crate::command::{lookup_spec, CommandSpec, RouteClass, COMMAND_TABLE};
 use crate::config::Config;
 use crate::protocol::frame::Reply;
 use crate::storage::shard::Shard;
@@ -30,6 +30,66 @@ pub fn apply_hello() -> Reply {
 
 pub fn apply_command_count() -> Reply {
     Reply::Int(COMMAND_TABLE.len() as i64)
+}
+
+pub fn apply_command_list() -> Reply {
+    Reply::Array(
+        COMMAND_TABLE
+            .iter()
+            .map(command_info)
+            .collect(),
+    )
+}
+
+pub fn apply_command_info(name: &Bytes) -> Reply {
+    let upper = String::from_utf8_lossy(name).to_ascii_uppercase();
+    match lookup_spec(&upper) {
+        Some(spec) => Reply::Array(vec![command_info(spec)]),
+        None => Reply::Array(vec![]),
+    }
+}
+
+fn command_info(spec: &CommandSpec) -> Reply {
+    let arity = if spec.max_arity < 0 {
+        -(spec.min_arity as i64)
+    } else {
+        spec.max_arity as i64
+    };
+    let flags = if spec.write {
+        vec![Reply::Bulk(Bytes::from("write"))]
+    } else {
+        vec![Reply::Bulk(Bytes::from("readonly"))]
+    };
+    let (firstkey, lastkey, step) = key_positions(spec);
+    Reply::Array(vec![
+        Reply::Bulk(Bytes::from(spec.name)),
+        Reply::Int(arity),
+        Reply::Array(flags),
+        Reply::Int(firstkey),
+        Reply::Int(lastkey),
+        Reply::Int(step),
+    ])
+}
+
+fn key_positions(spec: &CommandSpec) -> (i64, i64, i64) {
+    match spec.route {
+        RouteClass::Key => (1, 1, 1),
+        RouteClass::MultiDecompose => {
+            if spec.name == "MSET" || spec.name == "MSETNX" {
+                (1, -1, 2)
+            } else {
+                (1, -1, 1)
+            }
+        }
+        RouteClass::MultiGather => {
+            if spec.name.ends_with("STORE") {
+                (1, -1, 1)
+            } else {
+                (1, -1, 1)
+            }
+        }
+        _ => (0, 0, 0),
+    }
 }
 
 pub fn apply_config_get(pattern: &Bytes, config: &Config) -> Reply {

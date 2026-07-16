@@ -91,6 +91,50 @@ pub fn apply_sismember(shard: &mut Shard, key: &Bytes, member: &Bytes, now_ms: u
     Reply::Int(if s.contains(member) { 1 } else { 0 })
 }
 
+pub fn apply_sscan(
+    shard: &mut Shard,
+    key: &Bytes,
+    cursor: u64,
+    pattern: Option<&Bytes>,
+    count: usize,
+    now_ms: u64,
+) -> Reply {
+    shard.stats.record_command();
+    let Some(entry) = shard.lookup_live(key, now_ms) else {
+        return scan_reply(0, vec![]);
+    };
+    let Value::Set(s) = &entry.value else {
+        return wrongtype();
+    };
+    let mut members: Vec<_> = s.iter().cloned().collect();
+    members.sort();
+    let total = members.len();
+    if total == 0 {
+        return scan_reply(0, vec![]);
+    }
+    let start = (cursor as usize).min(total);
+    let mut pos = start;
+    let mut scanned = 0usize;
+    let mut out = Vec::new();
+    while scanned < count && pos < total {
+        let m = &members[pos];
+        if crate::command::hash::pattern_matches(pattern, m) {
+            out.push(Reply::Bulk(m.clone()));
+        }
+        pos += 1;
+        scanned += 1;
+    }
+    let next = if pos >= total { 0 } else { pos as u64 };
+    scan_reply(next, out)
+}
+
+fn scan_reply(cursor: u64, items: Vec<Reply>) -> Reply {
+    Reply::Array(vec![
+        Reply::Bulk(Bytes::from(cursor.to_string())),
+        Reply::Array(items),
+    ])
+}
+
 pub fn apply_smembers(shard: &mut Shard, key: &Bytes, now_ms: u64) -> Reply {
     shard.stats.record_command();
     let Some(entry) = shard.lookup_live(key, now_ms) else {

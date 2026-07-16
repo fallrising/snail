@@ -22,6 +22,7 @@ pub enum Command {
     Select(i64),
     Quit,
     Command(Option<Bytes>),
+    CommandCount,
     ConfigGet(Bytes),
     DbSize,
     FlushDb,
@@ -123,8 +124,8 @@ pub enum Command {
     ZIncrBy(Bytes, f64, Bytes),
     ZRange(Bytes, i64, i64, bool),
     ZRevRange(Bytes, i64, i64, bool),
-    ZRangeByScore(Bytes, f64, f64, bool, Option<(usize, usize)>),
-    ZRevRangeByScore(Bytes, f64, f64, bool, Option<(usize, usize)>),
+    ZRangeByScore(Bytes, ScoreBound, ScoreBound, bool, Option<(usize, usize)>),
+    ZRevRangeByScore(Bytes, ScoreBound, ScoreBound, bool, Option<(usize, usize)>),
     ZRank(Bytes, Bytes),
     ZRevRank(Bytes, Bytes),
     ZCount(Bytes, f64, f64),
@@ -158,6 +159,12 @@ pub struct GetExOptions {
     pub exat: Option<i64>,
     pub pxat: Option<i64>,
     pub persist: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreBound {
+    pub val: f64,
+    pub inclusive: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,7 +240,23 @@ fn parse_body(name: &str, args: &[Bytes]) -> Result<Command, CommandError> {
             Ok(Command::Select(db))
         }
         "QUIT" => Ok(Command::Quit),
-        "COMMAND" => Ok(Command::Command(args.first().cloned())),
+        "COMMAND" => {
+            if args.is_empty() {
+                Ok(Command::Command(None))
+            } else {
+                let sub = ascii_upper(&args[0]);
+                match sub.as_str() {
+                    "COUNT" => Ok(Command::CommandCount),
+                    "INFO" => {
+                        if args.len() < 2 {
+                            return Err(CommandError::WrongArity("COMMAND"));
+                        }
+                        Ok(Command::Command(Some(args[1].clone())))
+                    }
+                    _ => Ok(Command::Command(Some(args[0].clone()))),
+                }
+            }
+        }
         "CONFIG" => {
             if !eq_ignore_case(&args[0], b"GET") {
                 return Err(CommandError::UnknownSubcommand("CONFIG".into()));
@@ -510,7 +533,14 @@ pub fn command_keys(cmd: &Command) -> Vec<Bytes> {
     match cmd {
         Command::Del(ks) | Command::Exists(ks) | Command::MGet(ks) => ks.clone(),
         Command::MSet(pairs) | Command::MSetNx(pairs) => pairs.iter().map(|(k, _)| k.clone()).collect(),
-        Command::LPush(k, _) | Command::RPush(k, _) | Command::HGetAll(k) | Command::SAdd(k, _) => {
+        Command::LPush(k, _)
+        | Command::RPush(k, _)
+        | Command::HGetAll(k)
+        | Command::HSet(k, _)
+        | Command::HGet(k, _)
+        | Command::HScan { key: k, .. }
+        | Command::SScan { key: k, .. }
+        | Command::SAdd(k, _) => {
             vec![k.clone()]
         }
         Command::Rename(a, b) | Command::RenameNx(a, b) => vec![a.clone(), b.clone()],
@@ -531,8 +561,81 @@ fn extract_first_key(cmd: &Command) -> Vec<Bytes> {
         };
     }
     match cmd {
-        Command::Type(k) | Command::Expire(k, _) | Command::Ttl(k) | Command::Incr(k) => one!(k),
-        Command::ZAdd(k, _, _) | Command::ZRange(k, _, _, _) | Command::HSet(k, _) => one!(k),
+        Command::Get(k)
+        | Command::Set(k, _, _)
+        | Command::SetNx(k, _)
+        | Command::SetEx(k, _, _)
+        | Command::PSetEx(k, _, _)
+        | Command::GetSet(k, _)
+        | Command::GetDel(k)
+        | Command::GetEx(k, _)
+        | Command::Type(k)
+        | Command::Expire(k, _)
+        | Command::PExpire(k, _)
+        | Command::ExpireAt(k, _)
+        | Command::PExpireAt(k, _)
+        | Command::Ttl(k)
+        | Command::PTtl(k)
+        | Command::Persist(k)
+        | Command::Incr(k)
+        | Command::Decr(k)
+        | Command::IncrBy(k, _)
+        | Command::DecrBy(k, _)
+        | Command::IncrByFloat(k, _)
+        | Command::Append(k, _)
+        | Command::StrLen(k)
+        | Command::GetRange(k, _, _)
+        | Command::SetRange(k, _, _)
+        | Command::LPush(k, _)
+        | Command::RPush(k, _)
+        | Command::LPushX(k, _)
+        | Command::RPushX(k, _)
+        | Command::LPop(k, _)
+        | Command::RPop(k, _)
+        | Command::LLen(k)
+        | Command::LIndex(k, _)
+        | Command::LSet(k, _, _)
+        | Command::LRange(k, _, _)
+        | Command::LRem(k, _, _)
+        | Command::LTrim(k, _, _)
+        | Command::HSet(k, _)
+        | Command::HSetNx(k, _, _)
+        | Command::HGet(k, _)
+        | Command::HMGet(k, _)
+        | Command::HDel(k, _)
+        | Command::HExists(k, _)
+        | Command::HLen(k)
+        | Command::HStrLen(k, _)
+        | Command::HGetAll(k)
+        | Command::HKeys(k)
+        | Command::HVals(k)
+        | Command::HIncrBy(k, _, _)
+        | Command::HIncrByFloat(k, _, _)
+        | Command::SAdd(k, _)
+        | Command::SRem(k, _)
+        | Command::SCard(k)
+        | Command::SIsMember(k, _)
+        | Command::SMIsMember(k, _)
+        | Command::SMembers(k)
+        | Command::SPop(k, _)
+        | Command::SRandMember(k, _)
+        | Command::ZAdd(k, _, _)
+        | Command::ZRem(k, _)
+        | Command::ZScore(k, _)
+        | Command::ZMScore(k, _)
+        | Command::ZCard(k)
+        | Command::ZIncrBy(k, _, _)
+        | Command::ZRange(k, _, _, _)
+        | Command::ZRevRange(k, _, _, _)
+        | Command::ZRank(k, _)
+        | Command::ZRevRank(k, _)
+        | Command::ZCount(k, _, _)
+        | Command::ZPopMin(k, _)
+        | Command::ZPopMax(k, _) => one!(k),
+        Command::ZRangeByScore(k, _, _, _, _)
+        | Command::ZRevRangeByScore(k, _, _, _, _) => one!(k),
+        Command::HScan { key: k, .. } | Command::SScan { key: k, .. } => one!(k),
+        Command::Rename(src, _) | Command::RenameNx(src, _) => one!(src),
         _ => vec![],
     }
 }
@@ -540,7 +643,9 @@ fn extract_first_key(cmd: &Command) -> Vec<Bytes> {
 pub fn route_class(cmd: &Command) -> RouteClass {
     match cmd {
         Command::Ping(_) | Command::Echo(_) | Command::Hello(_) | Command::Select(_)
-        | Command::Quit | Command::Command(_) | Command::ConfigGet(_) => RouteClass::Local,
+        | Command::Quit | Command::Command(_) | Command::CommandCount | Command::ConfigGet(_) => {
+            RouteClass::Local
+        }
         Command::DbSize | Command::FlushDb | Command::FlushAll | Command::Info(_)
         | Command::Keys(_) | Command::RandomKey => RouteClass::Broadcast,
         Command::Scan { .. } => RouteClass::CursorTargeted,
@@ -627,7 +732,7 @@ pub static COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: "HELLO", min_arity: 1, max_arity: 2, route: RouteClass::Local, write: false },
     CommandSpec { name: "SELECT", min_arity: 2, max_arity: 2, route: RouteClass::Local, write: false },
     CommandSpec { name: "QUIT", min_arity: 1, max_arity: 1, route: RouteClass::Local, write: false },
-    CommandSpec { name: "COMMAND", min_arity: 1, max_arity: 2, route: RouteClass::Local, write: false },
+    CommandSpec { name: "COMMAND", min_arity: 1, max_arity: -1, route: RouteClass::Local, write: false },
     CommandSpec { name: "CONFIG", min_arity: 3, max_arity: 3, route: RouteClass::Local, write: false },
     CommandSpec { name: "DBSIZE", min_arity: 1, max_arity: 1, route: RouteClass::Broadcast, write: false },
     CommandSpec { name: "FLUSHDB", min_arity: 1, max_arity: 1, route: RouteClass::Broadcast, write: true },
@@ -649,4 +754,32 @@ pub static COMMAND_TABLE: &[CommandSpec] = &[
     CommandSpec { name: "TYPE", min_arity: 2, max_arity: 2, route: RouteClass::Key, write: false },
     CommandSpec { name: "EXISTS", min_arity: 2, max_arity: -1, route: RouteClass::MultiDecompose, write: false },
     CommandSpec { name: "KEYS", min_arity: 2, max_arity: 2, route: RouteClass::Broadcast, write: false },
+    CommandSpec { name: "RENAME", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: true },
+    CommandSpec { name: "RENAMENX", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: true },
+    CommandSpec { name: "MSETNX", min_arity: 3, max_arity: -1, route: RouteClass::MultiDecompose, write: true },
+    CommandSpec { name: "SMEMBERS", min_arity: 2, max_arity: 2, route: RouteClass::Key, write: false },
+    CommandSpec { name: "SINTER", min_arity: 2, max_arity: -1, route: RouteClass::MultiGather, write: false },
+    CommandSpec { name: "SUNION", min_arity: 2, max_arity: -1, route: RouteClass::MultiGather, write: false },
+    CommandSpec { name: "SDIFF", min_arity: 2, max_arity: -1, route: RouteClass::MultiGather, write: false },
+    CommandSpec { name: "SINTERSTORE", min_arity: 3, max_arity: -1, route: RouteClass::MultiGather, write: true },
+    CommandSpec { name: "SUNIONSTORE", min_arity: 3, max_arity: -1, route: RouteClass::MultiGather, write: true },
+    CommandSpec { name: "SDIFFSTORE", min_arity: 3, max_arity: -1, route: RouteClass::MultiGather, write: true },
+    CommandSpec { name: "SSCAN", min_arity: 3, max_arity: -1, route: RouteClass::Key, write: false },
+    CommandSpec { name: "HSET", min_arity: 4, max_arity: -1, route: RouteClass::Key, write: true },
+    CommandSpec { name: "HGET", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: false },
+    CommandSpec { name: "HGETALL", min_arity: 2, max_arity: 2, route: RouteClass::Key, write: false },
+    CommandSpec { name: "HSCAN", min_arity: 3, max_arity: -1, route: RouteClass::Key, write: false },
+    CommandSpec { name: "HLEN", min_arity: 2, max_arity: 2, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZRANGE", min_arity: 4, max_arity: 4, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZRANGEBYSCORE", min_arity: 4, max_arity: -1, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZREVRANGEBYSCORE", min_arity: 4, max_arity: -1, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZCARD", min_arity: 2, max_arity: 2, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZRANK", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZREVRANK", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZSCORE", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: false },
+    CommandSpec { name: "ZCOUNT", min_arity: 4, max_arity: 4, route: RouteClass::Key, write: false },
+    CommandSpec { name: "APPEND", min_arity: 3, max_arity: 3, route: RouteClass::Key, write: true },
+    CommandSpec { name: "GETRANGE", min_arity: 4, max_arity: 4, route: RouteClass::Key, write: false },
+    CommandSpec { name: "RPUSH", min_arity: 3, max_arity: -1, route: RouteClass::Key, write: true },
+    CommandSpec { name: "LRANGE", min_arity: 4, max_arity: 4, route: RouteClass::Key, write: false },
 ];

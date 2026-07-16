@@ -1,20 +1,20 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ahash::RandomState;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::command::apply;
-use crate::command::set::{get_set_members, set_op, SetOp};
-use crate::command::string;
-use crate::command::{route_class, Command, RouteClass};
+use crate::command::set::{set_op, SetOp};
+use crate::command::{command_keys, route_class, Command, RouteClass};
 use crate::config::Config;
+use crate::error::CommandError;
 use crate::protocol::frame::Reply;
 use crate::runtime::router::{ShardClient, ShardMap};
 use crate::storage::shard::{decode_scan_cursor, encode_scan_cursor, Shard};
-use crate::storage::value::Value;
 use crate::telemetry::ServerInfo;
 
 pub enum DispatchResult {
@@ -37,19 +37,50 @@ impl Dispatcher {
         match route_class(&cmd) {
             RouteClass::Local => DispatchResult::Immediate(self.exec_local(cmd)),
             RouteClass::Key => self.dispatch_key(cmd),
-            RouteClass::MultiDecompose => {
-                DispatchResult::Immediate(self.dispatch_multi_decompose(cmd))
-            }
-            RouteClass::MultiGather => {
-                DispatchResult::Immediate(self.dispatch_multi_gather(cmd))
+            RouteClass::MultiDecompose | RouteClass::MultiGather => {
+                let (tx, rx) = oneshot::channel();
+                let d = self.clone_for_async();
+                let is_gather = matches!(route_class(&cmd), RouteClass::MultiGather);
+                tokio::task::spawn_local(async move {
+                    let result = if is_gather {
+                        multi_gather_async(&d, cmd).await
+                    } else {
+                        multi_decompose_async(&d, cmd).await
+                    };
+                    let _ = tx.send(result);
+                });
+                DispatchResult::Pending(rx)
             }
             RouteClass::Broadcast => DispatchResult::Immediate(self.dispatch_broadcast(cmd)),
             RouteClass::CursorTargeted => DispatchResult::Immediate(self.dispatch_scan(cmd)),
         }
     }
 
+    fn clone_for_async(&self) -> Dispatcher {
+        Dispatcher {
+            worker_id: self.worker_id,
+            shard_map: self.shard_map.clone(),
+            shard_client: self.shard_client.clone(),
+            local_shards: self.local_shards.clone(),
+            config: self.config.clone(),
+            info: self.info.clone(),
+            now_ms: self.now_ms,
+        }
+    }
+
     fn dispatch_key(&self, cmd: Command) -> DispatchResult {
-        let key = first_key(&cmd).expect("key command");
+        if let Command::Rename(src, dst) | Command::RenameNx(src, dst) = &cmd {
+            let src_shard = self.shard_map.shard_of(src);
+            let dst_shard = self.shard_map.shard_of(dst);
+            if src_shard != dst_shard {
+                return DispatchResult::Immediate(crossslot_reply());
+            }
+        }
+
+        let key = command_keys(&cmd)
+            .into_iter()
+            .next()
+            .expect("key command");
         let shard_id = self.shard_map.shard_of(&key);
         if self.shard_map.owner_of(shard_id) == self.worker_id {
             DispatchResult::Immediate(self.apply_local(shard_id, cmd))
@@ -82,122 +113,6 @@ impl Dispatcher {
                 self.apply_local(shard_id, cmd)
             }
         }
-    }
-
-    fn dispatch_multi_decompose(&self, cmd: Command) -> Reply {
-        match cmd {
-            Command::MGet(keys) => {
-                let mut replies = Vec::with_capacity(keys.len());
-                for k in &keys {
-                    let sub = Command::Get(k.clone());
-                    let reply = match self.dispatch(sub) {
-                        DispatchResult::Immediate(r) => r,
-                        DispatchResult::Pending(_) => Reply::NullBulk,
-                    };
-                    replies.push(reply);
-                }
-                Reply::Array(replies)
-            }
-            Command::MSet(pairs) => {
-                for (k, v) in pairs {
-                    let sub = Command::Set(k, v, Default::default());
-                    match self.dispatch(sub) {
-                        DispatchResult::Immediate(_) => {}
-                        _ => {}
-                    }
-                }
-                Reply::Ok
-            }
-            Command::Del(keys) => {
-                let mut total = 0i64;
-                let mut groups: HashMap<usize, Vec<Bytes>> = HashMap::new();
-                for k in keys {
-                    groups
-                        .entry(self.shard_map.shard_of(&k))
-                        .or_default()
-                        .push(k);
-                }
-                for (shard_id, ks) in groups {
-                    let reply = if self.shard_map.owner_of(shard_id) == self.worker_id {
-                        self.apply_local(shard_id, Command::Del(ks))
-                    } else {
-                        // sync wait not available here - use local path only in sync context
-                        self.apply_local(shard_id, Command::Del(ks))
-                    };
-                    if let Reply::Int(n) = reply {
-                        total += n;
-                    }
-                }
-                Reply::Int(total)
-            }
-            Command::Exists(keys) => {
-                let mut total = 0i64;
-                for k in keys {
-                    let shard_id = self.shard_map.shard_of(&k);
-                    let reply = self.apply_local(shard_id, Command::Exists(vec![k]));
-                    if let Reply::Int(n) = reply {
-                        total += n;
-                    }
-                }
-                Reply::Int(total)
-            }
-            other => self.apply_local(0, other),
-        }
-    }
-
-    fn dispatch_multi_gather(&self, cmd: Command) -> Reply {
-        match cmd {
-            Command::SInter(keys) => self.set_gather(keys, SetOp::Inter, None),
-            Command::SUnion(keys) => self.set_gather(keys, SetOp::Union, None),
-            Command::SDiff(keys) => self.set_gather(keys, SetOp::Diff, None),
-            Command::SInterStore(dst, keys) => {
-                let result = self.set_gather(keys, SetOp::Inter, None);
-                if let Reply::Array(items) = result {
-                    let members: Vec<Bytes> = items
-                        .into_iter()
-                        .filter_map(|r| match r {
-                            Reply::Bulk(b) => Some(b),
-                            _ => None,
-                        })
-                        .collect();
-                    let _ = self.dispatch(Command::Del(vec![dst.clone()]));
-                    let reply = self.apply_local(
-                        self.shard_map.shard_of(&dst),
-                        Command::SAdd(dst, members),
-                    );
-                    if let Reply::Int(n) = reply {
-                        Reply::Int(n)
-                    } else {
-                        reply
-                    }
-                } else {
-                    result
-                }
-            }
-            other => self.apply_local(0, other),
-        }
-    }
-
-    fn set_gather(&self, keys: Vec<Bytes>, op: SetOp, _dst: Option<Bytes>) -> Reply {
-        let mut sets = Vec::new();
-        for k in &keys {
-            let shard_id = self.shard_map.shard_of(k);
-            let reply = self.apply_local(shard_id, Command::SMembers(k.clone()));
-            if let Reply::Array(items) = reply {
-                let mut set = ahash::RandomState::new();
-                let mut hs = std::collections::HashSet::with_hasher(set);
-                for item in items {
-                    if let Reply::Bulk(b) = item {
-                        hs.insert(b);
-                    }
-                }
-                sets.push(hs);
-            } else if let Reply::Err(_, _) = reply {
-                return reply;
-            }
-        }
-        let result = set_op(sets, op);
-        Reply::Array(result.into_iter().map(|m| Reply::Bulk(m)).collect())
     }
 
     fn dispatch_broadcast(&self, cmd: Command) -> Reply {
@@ -253,11 +168,7 @@ impl Dispatcher {
         let mut shards = self.local_shards.borrow_mut();
         let idx = shard_id % shards.len();
         let shard = &mut shards[idx];
-        let (next_local, keys) = shard.scan_step(
-            local_cursor,
-            count,
-            pat.as_deref(),
-        );
+        let (next_local, keys) = shard.scan_step(local_cursor, count, pat.as_deref());
         let next_shard = if next_local == 0 {
             (shard_id + 1) % self.shard_map.num_shards()
         } else {
@@ -279,24 +190,173 @@ impl Dispatcher {
     }
 }
 
-fn first_key(cmd: &Command) -> Option<Bytes> {
-    match cmd {
-        Command::Get(k) | Command::Set(k, _, _) | Command::Type(k) => Some(k.clone()),
-        Command::LPush(k, _) | Command::HGetAll(k) | Command::SAdd(k, _) | Command::ZAdd(k, _, _) => {
-            Some(k.clone())
-        }
-        _ => None,
+async fn send_shard(d: &Dispatcher, shard_id: usize, cmd: Command) -> Reply {
+    if d.shard_map.owner_of(shard_id) == d.worker_id {
+        d.apply_local(shard_id, cmd)
+    } else {
+        let rx = d.shard_client.send_to(shard_id, cmd);
+        rx.await.unwrap_or_else(|_| shard_unavailable())
     }
+}
+
+async fn multi_decompose_async(d: &Dispatcher, cmd: Command) -> Reply {
+    match cmd {
+        Command::MGet(keys) => {
+            let mut replies = Vec::with_capacity(keys.len());
+            for k in keys {
+                replies.push(send_shard(d, d.shard_map.shard_of(&k), Command::Get(k)).await);
+            }
+            Reply::Array(replies)
+        }
+        Command::MSet(pairs) => {
+            for (k, v) in pairs {
+                let shard_id = d.shard_map.shard_of(&k);
+                send_shard(d, shard_id, Command::Set(k, v, Default::default())).await;
+            }
+            Reply::Ok
+        }
+        Command::MSetNx(pairs) => {
+            for (k, _) in &pairs {
+                let reply = send_shard(
+                    d,
+                    d.shard_map.shard_of(k),
+                    Command::Exists(vec![k.clone()]),
+                )
+                .await;
+                if let Reply::Int(n) = reply {
+                    if n > 0 {
+                        return Reply::Int(0);
+                    }
+                }
+            }
+            for (k, v) in pairs {
+                let shard_id = d.shard_map.shard_of(&k);
+                send_shard(d, shard_id, Command::Set(k, v, Default::default())).await;
+            }
+            Reply::Int(1)
+        }
+        Command::Del(keys) => {
+            let mut groups: HashMap<usize, Vec<Bytes>> = HashMap::new();
+            for k in keys {
+                groups
+                    .entry(d.shard_map.shard_of(&k))
+                    .or_default()
+                    .push(k);
+            }
+            let mut total = 0i64;
+            for (shard_id, ks) in groups {
+                let reply = send_shard(d, shard_id, Command::Del(ks)).await;
+                if let Reply::Int(n) = reply {
+                    total += n;
+                }
+            }
+            Reply::Int(total)
+        }
+        Command::Exists(keys) => {
+            let mut groups: HashMap<usize, Vec<Bytes>> = HashMap::new();
+            for k in keys {
+                groups
+                    .entry(d.shard_map.shard_of(&k))
+                    .or_default()
+                    .push(k);
+            }
+            let mut total = 0i64;
+            for (shard_id, ks) in groups {
+                let reply = send_shard(d, shard_id, Command::Exists(ks)).await;
+                if let Reply::Int(n) = reply {
+                    total += n;
+                }
+            }
+            Reply::Int(total)
+        }
+        other => d.apply_local(0, other),
+    }
+}
+
+async fn multi_gather_async(d: &Dispatcher, cmd: Command) -> Reply {
+    match cmd {
+        Command::SInter(keys) => set_gather_async(d, keys, SetOp::Inter).await,
+        Command::SUnion(keys) => set_gather_async(d, keys, SetOp::Union).await,
+        Command::SDiff(keys) => set_gather_async(d, keys, SetOp::Diff).await,
+        Command::SInterStore(dst, keys) => {
+            set_store_async(d, dst, keys, SetOp::Inter).await
+        }
+        Command::SUnionStore(dst, keys) => {
+            set_store_async(d, dst, keys, SetOp::Union).await
+        }
+        Command::SDiffStore(dst, keys) => set_store_async(d, dst, keys, SetOp::Diff).await,
+        other => d.apply_local(0, other),
+    }
+}
+
+async fn set_gather_async(d: &Dispatcher, keys: Vec<Bytes>, op: SetOp) -> Reply {
+    let sets = match fetch_sets(d, &keys).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let result = set_op(sets, op);
+    Reply::Array(result.into_iter().map(|m| Reply::Bulk(m)).collect())
+}
+
+async fn set_store_async(d: &Dispatcher, dst: Bytes, keys: Vec<Bytes>, op: SetOp) -> Reply {
+    let sets = match fetch_sets(d, &keys).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let result = set_op(sets, op);
+    let count = result.len() as i64;
+    let members: Vec<Bytes> = result.into_iter().collect();
+    let dst_shard = d.shard_map.shard_of(&dst);
+    send_shard(d, dst_shard, Command::Del(vec![dst.clone()])).await;
+    let reply = send_shard(d, dst_shard, Command::SAdd(dst, members)).await;
+    match reply {
+        Reply::Err(_, _) => reply,
+        _ => Reply::Int(count),
+    }
+}
+
+async fn fetch_sets(
+    d: &Dispatcher,
+    keys: &[Bytes],
+) -> Result<Vec<HashSet<Bytes, RandomState>>, Reply> {
+    let mut sets = Vec::with_capacity(keys.len());
+    for k in keys {
+        let shard_id = d.shard_map.shard_of(k);
+        let reply = send_shard(d, shard_id, Command::SMembers(k.clone())).await;
+        match reply {
+            Reply::Array(items) => {
+                let mut hs = HashSet::with_hasher(RandomState::new());
+                for item in items {
+                    if let Reply::Bulk(b) = item {
+                        hs.insert(b);
+                    }
+                }
+                sets.push(hs);
+            }
+            Reply::Err(_, _) => return Err(reply),
+            _ => sets.push(HashSet::with_hasher(RandomState::new())),
+        }
+    }
+    Ok(sets)
+}
+
+fn crossslot_reply() -> Reply {
+    Reply::Err(
+        crate::protocol::frame::CommandErrKind::Generic,
+        CommandError::CrossSlot.to_resp(),
+    )
+}
+
+fn shard_unavailable() -> Reply {
+    Reply::Err(
+        crate::protocol::frame::CommandErrKind::Generic,
+        "shard unavailable".into(),
+    )
 }
 
 pub async fn dispatch_async(dispatcher: &Dispatcher, cmd: Command) -> Reply {
     match dispatcher.dispatch(cmd) {
         DispatchResult::Immediate(r) => r,
-        DispatchResult::Pending(rx) => rx.await.unwrap_or_else(|_| {
-            Reply::Err(
-                crate::protocol::frame::CommandErrKind::Generic,
-                "shard unavailable".into(),
-            )
-        }),
+        DispatchResult::Pending(rx) => rx.await.unwrap_or_else(|_| shard_unavailable()),
     }
 }

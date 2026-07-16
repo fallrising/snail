@@ -20,13 +20,11 @@ pub fn apply(shard: &mut Shard, cmd: Command, now_ms: u64, config: &Config, info
         Command::Echo(msg) => server::apply_echo(msg),
         Command::Hello(_) => server::apply_hello(),
         Command::Select(_) => Reply::Ok,
-        Command::Command(opt) => {
-            if opt.is_some() {
-                server::apply_command_count()
-            } else {
-                Reply::Array(vec![])
-            }
-        }
+        Command::Command(opt) => match opt {
+            Some(name) => server::apply_command_info(&name),
+            None => server::apply_command_list(),
+        },
+        Command::CommandCount => server::apply_command_count(),
         Command::ConfigGet(pat) => server::apply_config_get(&pat, config),
         Command::DbSize => server::apply_db_size(shard),
         Command::FlushDb | Command::FlushAll => server::apply_flush(shard),
@@ -252,13 +250,7 @@ pub fn apply(shard: &mut Shard, cmd: Command, now_ms: u64, config: &Config, info
             cursor,
             pattern,
             count,
-        } => {
-            let members = set::apply_smembers(shard, &key, now_ms);
-            Reply::Array(vec![
-                Reply::Bulk(Bytes::from("0")),
-                members,
-            ])
-        }
+        } => set::apply_sscan(shard, &key, cursor, pattern.as_ref(), count, now_ms),
 
         Command::ZAdd(k, opts, pairs) => zset::apply_zadd(shard, k, opts, pairs, now_ms, config),
         Command::ZRem(k, ms) => {
@@ -340,10 +332,10 @@ pub fn apply(shard: &mut Shard, cmd: Command, now_ms: u64, config: &Config, info
         Command::ZRange(k, s, e, ws) => zset::apply_zrange(shard, &k, s, e, ws, false, now_ms),
         Command::ZRevRange(k, s, e, ws) => zset::apply_zrange(shard, &k, s, e, ws, true, now_ms),
         Command::ZRangeByScore(k, min, max, ws, lim) => {
-            zset::apply_zrange(shard, &k, 0, i64::MAX, ws, false, now_ms)
+            zset::apply_zrangebyscore(shard, &k, min, max, ws, lim, false, now_ms)
         }
         Command::ZRevRangeByScore(k, min, max, ws, lim) => {
-            zset::apply_zrange(shard, &k, 0, i64::MAX, ws, true, now_ms)
+            zset::apply_zrangebyscore(shard, &k, min, max, ws, lim, true, now_ms)
         }
         Command::ZRank(k, m) => zset::apply_zrank(shard, &k, &m, false, now_ms),
         Command::ZRevRank(k, m) => zset::apply_zrank(shard, &k, &m, true, now_ms),

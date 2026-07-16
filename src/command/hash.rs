@@ -202,37 +202,35 @@ pub fn apply_hscan(
 ) -> Reply {
     shard.stats.record_command();
     let Some(entry) = shard.lookup_live(key, now_ms) else {
-        return Reply::Array(vec![Reply::Bulk(Bytes::from("0")), Reply::Array(vec![])]);
+        return scan_reply(0, vec![]);
     };
     let Value::Hash(m) = &entry.value else {
         return wrongtype();
     };
-    let keys: Vec<_> = m.keys().cloned().collect();
-    let total = keys.len();
-    let mut pos = (cursor as usize) % total.max(1);
-    let mut out = Vec::new();
+    let mut fields: Vec<_> = m.keys().cloned().collect();
+    fields.sort();
+    let total = fields.len();
     if total == 0 {
-        return Reply::Array(vec![
-            Reply::Bulk(Bytes::from("0")),
-            Reply::Array(vec![]),
-        ]);
+        return scan_reply(0, vec![]);
     }
-    while out.len() < count * 2 && pos < total {
-        let k = &keys[pos];
-        if pattern_matches(pattern, k) {
-            out.push(Reply::Bulk(k.clone()));
-            out.push(Reply::Bulk(m[k].clone()));
+    let start = (cursor as usize).min(total);
+    let mut pos = start;
+    let mut scanned = 0usize;
+    let mut out = Vec::new();
+    while scanned < count && pos < total {
+        let f = &fields[pos];
+        if pattern_matches(pattern, f) {
+            out.push(Reply::Bulk(f.clone()));
+            out.push(Reply::Bulk(m[f].clone()));
         }
         pos += 1;
+        scanned += 1;
     }
-    let next = if pos >= total { 0 } else { pos };
-    Reply::Array(vec![
-        Reply::Bulk(Bytes::from(next.to_string())),
-        Reply::Array(out),
-    ])
+    let next = if pos >= total { 0 } else { pos as u64 };
+    scan_reply(next, out)
 }
 
-fn pattern_matches(pattern: Option<&Bytes>, key: &Bytes) -> bool {
+pub fn pattern_matches(pattern: Option<&Bytes>, key: &Bytes) -> bool {
     let Some(pat) = pattern else {
         return true;
     };
@@ -245,6 +243,13 @@ fn pattern_matches(pattern: Option<&Bytes>, key: &Bytes) -> bool {
         return key.starts_with(prefix);
     }
     key == pat
+}
+
+fn scan_reply(cursor: u64, items: Vec<Reply>) -> Reply {
+    Reply::Array(vec![
+        Reply::Bulk(Bytes::from(cursor.to_string())),
+        Reply::Array(items),
+    ])
 }
 
 fn wrongtype() -> Reply {

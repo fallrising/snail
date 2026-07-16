@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
-use crate::command::dispatcher::{dispatch_async, Dispatcher};
+use crate::command::dispatcher::Dispatcher;
 use crate::command::parse;
 use crate::error::{command_err_reply, protocol_err_reply, CommandError, ProtocolError};
 use crate::net::buffer::BufferPool;
@@ -78,6 +78,38 @@ struct Connection {
 impl Connection {
     async fn run(&mut self) {
         loop {
+            self.harvest_replies().await;
+
+            if !self.out_buf.is_empty() {
+                match self.stream.write_all(&self.out_buf).await {
+                    Ok(()) => {
+                        self.bytes_pending =
+                            self.bytes_pending.saturating_sub(self.out_buf.len());
+                        self.out_buf.clear();
+                    }
+                    Err(e) => {
+                        tracing::debug!("write error: {e}");
+                        break;
+                    }
+                }
+            }
+
+            if self.can_read() && !self.read_buf.is_empty() {
+                *self.ctx.now_ms.borrow_mut() = current_ms();
+                if let Err(e) = self.process_input().await {
+                    self.enqueue_err(protocol_err_reply(&e));
+                    self.state = ConnState::CloseAfterFlush;
+                }
+            }
+
+            if self.should_close() {
+                break;
+            }
+
+            if self.bytes_pending > self.ctx.config.out_buf_hard {
+                break;
+            }
+
             if self.can_read() {
                 match self.stream.read_buf(&mut self.read_buf).await {
                     Ok(0) => break,
@@ -93,39 +125,12 @@ impl Connection {
                         break;
                     }
                 }
-            }
-
-            self.harvest_replies().await;
-
-            if !self.out_buf.is_empty() {
-                match self.stream.write_all(&self.out_buf).await {
-                    Ok(()) => {
-                        self.bytes_pending = self.bytes_pending.saturating_sub(self.out_buf.len());
-                        self.out_buf.clear();
-                    }
-                    Err(e) => {
-                        tracing::debug!("write error: {e}");
-                        break;
-                    }
-                }
-            }
-
-            if self.bytes_pending > self.ctx.config.out_buf_hard {
-                break;
-            }
-
-            match self.state {
-                ConnState::CloseAfterFlush if self.out_buf.is_empty() && self.pending.is_empty() => {
-                    break;
-                }
-                ConnState::Draining if self.pending.is_empty() && self.out_buf.is_empty() => {
-                    break;
-                }
-                _ => {}
-            }
-
-            if !self.can_read() && self.pending.is_empty() && self.read_buf.is_empty() {
+            } else if !self.out_buf.is_empty() {
+                let _ = self.stream.writable().await;
+            } else if self.waiting_on_async() {
                 tokio::task::yield_now().await;
+            } else {
+                let _ = self.stream.readable().await;
             }
         }
 
@@ -134,10 +139,26 @@ impl Connection {
         }
     }
 
+    fn waiting_on_async(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|s| s.ready.is_none() && s.pending.is_some())
+    }
+
     fn can_read(&self) -> bool {
         !matches!(self.state, ConnState::Draining | ConnState::CloseAfterFlush)
             && self.bytes_pending < self.ctx.config.out_buf_soft
             && self.pending.len() < self.ctx.config.pipeline_cap
+    }
+
+    fn should_close(&self) -> bool {
+        match self.state {
+            ConnState::CloseAfterFlush if self.out_buf.is_empty() && self.pending.is_empty() => {
+                true
+            }
+            ConnState::Draining if self.pending.is_empty() && self.out_buf.is_empty() => true,
+            _ => false,
+        }
     }
 
     async fn process_input(&mut self) -> Result<(), ProtocolError> {
@@ -219,17 +240,12 @@ impl Connection {
     }
 
     fn enqueue_err(&mut self, msg: String) {
-        let mut buf = BytesMut::new();
-        buf.put_slice(msg.as_bytes());
         let before = self.out_buf.len();
-        self.out_buf.extend_from_slice(&buf);
+        self.out_buf.extend_from_slice(msg.as_bytes());
         self.bytes_pending += self.out_buf.len() - before;
     }
 
     fn enqueue_cmd_err(&mut self, err: CommandError) {
-        let msg = command_err_reply(&err);
-        let mut tmp = BytesMut::new();
-        tmp.extend_from_slice(msg.as_bytes());
         self.pending.push_back(ReplySlot {
             ready: Some(Reply::Err(
                 crate::protocol::frame::CommandErrKind::Generic,

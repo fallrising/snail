@@ -9,8 +9,12 @@ license = "MIT"
 name = "rudis"
 path = "src/main.rs"
 
+[[bin]]
+name = "rudis-bench"
+path = "src/bin/rudis-bench.rs"
+
 [dependencies]
-tokio = { version = "1.40", features = ["rt", "net", "io-util", "sync", "time", "signal", "macros"] }
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
 bytes = "1.7"
 ahash = "0.8"
 socket2 = { version = "0.5", features = ["all"] }

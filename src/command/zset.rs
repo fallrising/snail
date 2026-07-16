@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use ahash::RandomState;
 use bytes::Bytes;
 
-use crate::command::{parse_f64_arg, parse_i64_arg, Command, CommandError, ZAddOptions};
+use crate::command::{parse_f64_arg, parse_i64_arg, Command, CommandError, ScoreBound, ZAddOptions};
 use crate::config::Config;
 use crate::protocol::frame::Reply;
 use crate::storage::shard::{Entry, Shard};
@@ -51,10 +51,29 @@ pub fn parse_zrange(args: &[Bytes], rev: bool) -> Result<Command, CommandError> 
     }
 }
 
+pub fn parse_score_bound(b: &Bytes) -> Result<ScoreBound, CommandError> {
+    let s = std::str::from_utf8(b).map_err(|_| CommandError::NotFloat)?;
+    let inclusive = !s.starts_with('(');
+    let num = if inclusive { s } else { &s[1..] };
+    let val = match num.to_ascii_lowercase().as_str() {
+        "-inf" => f64::NEG_INFINITY,
+        "+inf" | "inf" => f64::INFINITY,
+        _ => num.parse().map_err(|_| CommandError::NotFloat)?,
+    };
+    if val.is_nan() {
+        return Err(CommandError::NotFloat);
+    }
+    Ok(ScoreBound { val, inclusive })
+}
+
 pub fn parse_zrangebyscore(args: &[Bytes], rev: bool) -> Result<Command, CommandError> {
     let key = args[0].clone();
-    let min = parse_f64_arg(&args[1])?;
-    let max = parse_f64_arg(&args[2])?;
+    // ZRANGEBYSCORE: min max; ZREVRANGEBYSCORE: max min (Redis convention).
+    let (min, max) = if rev {
+        (parse_score_bound(&args[2])?, parse_score_bound(&args[1])?)
+    } else {
+        (parse_score_bound(&args[1])?, parse_score_bound(&args[2])?)
+    };
     let mut withscores = false;
     let mut limit = None;
     let mut i = 3;
@@ -157,6 +176,64 @@ pub fn zset_insert(z: &mut ZSetValue, member: Bytes, score: f64) {
 pub fn zset_remove_member(z: &mut ZSetValue, member: &Bytes, score: f64) {
     z.scores.remove(member);
     z.order.remove(&(OrdF64(score), member.clone()));
+}
+
+fn score_in_range(score: f64, min: ScoreBound, max: ScoreBound) -> bool {
+    let above = if min.inclusive {
+        score >= min.val
+    } else {
+        score > min.val
+    };
+    let below = if max.inclusive {
+        score <= max.val
+    } else {
+        score < max.val
+    };
+    above && below
+}
+
+pub fn apply_zrangebyscore(
+    shard: &mut Shard,
+    key: &Bytes,
+    min: ScoreBound,
+    max: ScoreBound,
+    withscores: bool,
+    limit: Option<(usize, usize)>,
+    rev: bool,
+    now_ms: u64,
+) -> Reply {
+    shard.stats.record_command();
+    let Some(entry) = shard.lookup_live(key, now_ms) else {
+        return Reply::Array(vec![]);
+    };
+    let Value::ZSet(z) = &entry.value else {
+        return wrongtype();
+    };
+    let mut matched: Vec<(Bytes, f64)> = z
+        .order
+        .iter()
+        .map(|((s, m), _)| (m.clone(), s.0))
+        .filter(|(_, score)| score_in_range(*score, min, max))
+        .collect();
+    if rev {
+        matched.reverse();
+    }
+    if let Some((offset, count)) = limit {
+        if offset >= matched.len() {
+            matched.clear();
+        } else {
+            let end = (offset + count).min(matched.len());
+            matched = matched[offset..end].to_vec();
+        }
+    }
+    let mut out = Vec::new();
+    for (m, score) in matched {
+        out.push(Reply::Bulk(m));
+        if withscores {
+            out.push(Reply::Bulk(Bytes::from(score.to_string())));
+        }
+    }
+    Reply::Array(out)
 }
 
 pub fn apply_zrange(
