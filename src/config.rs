@@ -1,8 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
-
 use serde::Deserialize;
 
 use crate::error::ServerError;

@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
 use crate::error::ServerError;
-use crate::runtime::router::{ShardClient, ShardMap, ShardRequest};
+use crate::runtime::router::{ShardClient, ShardMap};
 use crate::runtime::shutdown::ShutdownHandle;
 use crate::runtime::worker;
 use crate::telemetry::ServerInfo;
@@ -30,7 +30,7 @@ pub async fn start(config: Arc<Config>) -> Result<ShutdownHandle, ServerError> {
     let hash_seed: u64 = rand::thread_rng().gen();
     let shard_map = Arc::new(ShardMap::new(config.shards, config.workers, hash_seed));
     let conn_count = Arc::new(AtomicUsize::new(0));
-    let info = Arc::new(ServerInfo::new(&config));
+    let info = Arc::new(ServerInfo::new(&config, conn_count.clone()));
 
     let (shutdown_tx, _) = broadcast::channel(1);
 

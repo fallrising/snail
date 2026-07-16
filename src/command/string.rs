@@ -1,8 +1,7 @@
 use bytes::Bytes;
 
-use crate::command::{parse_f64_arg, parse_i64_arg, Command, CommandError, GetExOptions, SetOptions};
+use crate::command::{parse_i64_arg, Command, CommandError, GetExOptions, SetOptions};
 use crate::config::Config;
-use crate::error::CommandError as CE;
 use crate::protocol::frame::Reply;
 use crate::storage::shard::{Entry, Shard};
 use crate::storage::value::{parse_f64_bytes, parse_i64_bytes, Value};

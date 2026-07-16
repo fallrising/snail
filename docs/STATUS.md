@@ -44,7 +44,17 @@
 | 判定 | **FAIL** | PASS |
 
 - 單連線基線：p99 ≈ 0.29 ms（熱路徑正常；瓶頸在 10K 連線調度）
-- per-shard ops 指標暴露：⬜ 待做
+- per-shard ops 指標暴露：✅ `INFO STATS` 提供各 shard commands / keys / expires / memory
+
+### P3 — 可觀測性與協議正確性 ✅
+
+- `INFO` 改用 process-wide atomic snapshot，任一 worker 均可讀取全局統計
+  - aggregate：commands / hits / misses / expired / flushed / keys / expires / memory
+  - per-shard：`rudis_shard_<id>_commands` / keys / expires / used_memory
+- 修正 RESP bulk length 在 TCP 封包切於 `$` 或 CRLF 中間時的 parser state corruption
+- 修正相同 deadline 的多個 key 共用 expiry sequence、導致 expire index 互相覆蓋
+- active expire 現在同步更新 memory 與 telemetry gauges
+- 測試啟動改用 Cargo binary discovery，乾淨 checkout 可直接 `cargo test`
 
 ## 已實作模組
 
@@ -98,10 +108,13 @@
 | `tests/commands_hash.rs` | ✅ |
 | `tests/commands_zset.rs` | ✅ |
 | `tests/commands_keys.rs` | ✅ |
+| RESP 逐 byte 增量解析 | ✅ |
+| 相同 deadline 多 key 過期 | ✅ |
+| 多 worker `INFO` shard metrics | ✅ |
 | C10K 壓測（p99 < 5ms） | 🟡 已跑，p99 未達標 |
 
 ```bash
-cargo test   # 目前 18 項全綠
+cargo test   # 目前 21 項全綠
 ```
 
 ## 已知限制與語義差異
@@ -118,25 +131,24 @@ cargo test   # 目前 18 項全綠
 ### P0 — C10K p99 達標（M2 前置）
 
 1. **每 worker 連線反應器**：取代 per-connection `spawn_local`，單 epoll 迴圈驅動多連線
-2. per-shard ops 指標暴露（驗證負載均衡）
 
 ### P1 — M1 收尾
 
-3. 補齊 `COMMAND_TABLE` 剩餘命令註冊
-4. 更多 `tests/commands/` 覆蓋（list / set / server）
+2. 補齊 `COMMAND_TABLE` 剩餘命令註冊
+3. 更多 `tests/commands/` 覆蓋（list / set / server）
 
 ### P2 — M2 承壓層
 
-5. 空閒連線 read buffer 歸還 pool（C1M 記憶體預算關鍵）
-6. 優雅停機：broadcast → drain → deadline
-7. `maxclients` 超限回 `-ERR max number of clients reached` 後關閉
-8. C100K 連線持有驗收
+4. 空閒連線 read buffer 歸還 pool（C1M 記憶體預算關鍵）
+5. 優雅停機：broadcast → drain → deadline
+6. `maxclients` 超限回 `-ERR max number of clients reached` 後關閉
+7. C100K 連線持有驗收
 
 ### P3 — M3 極限
 
-9. `scripts/sysctl-tuning.sh` 定稿（含還原）
-10. 自寫 C1M 連線持有器（PING 心跳 + RTT 統計）
-11. 可選：`io_uring` feature 切換
+8. `scripts/sysctl-tuning.sh` 定稿（含還原）
+9. 自寫 C1M 連線持有器（PING 心跳 + RTT 統計）
+10. 可選：`io_uring` feature 切換
 
 ## 目錄對照
 

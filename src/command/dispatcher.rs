@@ -141,10 +141,7 @@ impl Dispatcher {
                 Reply::Array(keys)
             }
             Command::Info(section) => {
-                let shards = self.local_shards.borrow();
-                let mut info = (*self.info).clone();
-                info.aggregate_shards(&shards);
-                crate::command::server::build_info(&info, section.as_ref())
+                crate::command::server::build_info(&self.info, section.as_ref())
             }
             other => self.apply_local(0, other),
         }

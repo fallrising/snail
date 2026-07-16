@@ -21,11 +21,10 @@ pub struct Shard {
     pub mem_used: u64,
     pub stats: ShardStats,
     seq_counter: u64,
-    scan_cursor: usize,
 }
 
 impl Shard {
-    pub fn new(id: usize, hash_seed: u64) -> Self {
+    pub fn new(id: usize, hash_seed: u64, stats: ShardStats) -> Self {
         let state = RandomState::with_seeds(
             hash_seed,
             hash_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
@@ -37,9 +36,8 @@ impl Shard {
             dict: HashMap::with_hasher(state),
             expires: ExpireIndex::default(),
             mem_used: 0,
-            stats: ShardStats::default(),
+            stats,
             seq_counter: 0,
-            scan_cursor: 0,
         }
     }
 
@@ -68,7 +66,7 @@ impl Shard {
             .unwrap_or(false);
         if expired {
             self.remove_key(key);
-            self.stats.expired += 1;
+            self.stats.record_expired();
             return None;
         }
         self.dict.get(key)
@@ -83,7 +81,7 @@ impl Shard {
             .unwrap_or(false);
         if expired {
             self.remove_key(key);
-            self.stats.expired += 1;
+            self.stats.record_expired();
             return None;
         }
         self.dict.get_mut(key)
@@ -97,7 +95,7 @@ impl Shard {
         self.dict.contains_key(key)
     }
 
-    pub fn write_entry(&mut self, key: Bytes, entry: Entry) {
+    pub fn write_entry(&mut self, key: Bytes, mut entry: Entry) {
         let new_size = Self::estimate_entry(&key, &entry);
         if let Some(old) = self.dict.get(&key) {
             let old_size = Self::estimate_entry(&key, old);
@@ -106,11 +104,15 @@ impl Shard {
                 self.expires.remove(deadline, seq);
             }
         }
-        if let Some((deadline, seq)) = entry.expire {
+        if let Some((deadline, _)) = entry.expire {
+            self.seq_counter += 1;
+            let seq = self.seq_counter;
+            entry.expire = Some((deadline, seq));
             self.expires.insert(deadline, seq, key.clone());
         }
         self.mem_used += new_size;
         self.dict.insert(key, entry);
+        self.publish_gauges();
     }
 
     pub fn remove_key(&mut self, key: &Bytes) -> Option<Entry> {
@@ -120,6 +122,7 @@ impl Shard {
             if let Some((deadline, seq)) = old.expire {
                 self.expires.remove(deadline, seq);
             }
+            self.publish_gauges();
             Some(old)
         } else {
             None
@@ -137,6 +140,7 @@ impl Shard {
         let seq = self.seq_counter;
         entry.expire = Some((deadline_ms, seq));
         self.expires.insert(deadline_ms, seq, key.clone());
+        self.publish_gauges();
         true
     }
 
@@ -146,6 +150,7 @@ impl Shard {
         };
         if let Some((deadline, seq)) = entry.expire.take() {
             self.expires.remove(deadline, seq);
+            self.publish_gauges();
             true
         } else {
             false
@@ -172,11 +177,17 @@ impl Shard {
             }
             let key = key.clone();
             self.expires.remove(deadline, seq);
-            if self.dict.remove(&key).is_some() {
-                self.stats.expired += 1;
+            let is_current = self
+                .dict
+                .get(&key)
+                .and_then(|entry| entry.expire)
+                == Some((deadline, seq));
+            if is_current && self.remove_key(&key).is_some() {
+                self.stats.record_expired();
                 removed += 1;
             }
         }
+        self.publish_gauges();
         removed
     }
 
@@ -209,7 +220,8 @@ impl Shard {
         self.dict.clear();
         self.expires = ExpireIndex::default();
         self.mem_used = 0;
-        self.stats.keys_flushed += n as u64;
+        self.stats.record_flushed(n);
+        self.publish_gauges();
         n
     }
 
@@ -231,6 +243,11 @@ impl Shard {
         }
         self.mem_used.saturating_add(delta) <= maxmemory
     }
+
+    fn publish_gauges(&self) {
+        self.stats
+            .update_gauges(self.dict.len(), self.expires.len(), self.mem_used);
+    }
 }
 
 fn pattern_matches(pattern: Option<&str>, key: &Bytes) -> bool {
@@ -250,7 +267,7 @@ fn pattern_matches(pattern: Option<&str>, key: &Bytes) -> bool {
     key_str == pat
 }
 
-pub fn encode_scan_cursor(shard_id: usize, local: usize, shards: usize) -> u64 {
+pub fn encode_scan_cursor(shard_id: usize, local: usize, _shards: usize) -> u64 {
     ((shard_id as u64) << 48) | (local as u64 & 0x0000_FFFF_FFFF)
 }
 
@@ -261,5 +278,40 @@ pub fn decode_scan_cursor(cursor: u64, shards: usize) -> (usize, usize) {
         let shard = ((cursor >> 48) as usize) % shards;
         let local = (cursor & 0x0000_FFFF_FFFF) as usize;
         (shard, local)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_expire_handles_keys_with_identical_deadlines() {
+        let stats = ShardStats::default();
+        let mut shard = Shard::new(0, 42, stats.clone());
+        for key in ["first", "second"] {
+            shard.write_entry(
+                Bytes::from(key),
+                Entry {
+                    value: Value::Str(Bytes::from_static(b"value")),
+                    expire: Some((100, 0)),
+                },
+            );
+        }
+
+        assert_eq!(shard.expires_len(), 2);
+        assert_eq!(stats.snapshot().expires, 2);
+        assert!(shard.mem_used > 0);
+
+        assert_eq!(shard.active_expire(100, 10), 2);
+        assert_eq!(shard.len(), 0);
+        assert_eq!(shard.mem_used, 0);
+        assert_eq!(
+            stats.snapshot(),
+            crate::storage::stats::ShardStatsSnapshot {
+                expired: 2,
+                ..Default::default()
+            }
+        );
     }
 }

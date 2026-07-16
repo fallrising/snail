@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 fn start_server(port: u16) -> Child {
-    Command::new("./target/release/rudis")
+    Command::new(env!("CARGO_BIN_EXE_rudis"))
         .args(["--port", &port.to_string(), "--workers", "1", "--shards", "1"])
         .spawn()
         .expect("start rudis")

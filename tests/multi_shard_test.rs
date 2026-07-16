@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 fn start_server(port: u16, workers: u16, shards: u16) -> Child {
-    Command::new("./target/release/rudis")
+    Command::new(env!("CARGO_BIN_EXE_rudis"))
         .args([
             "--port",
             &port.to_string(),
@@ -169,4 +169,67 @@ fn rename_cross_shard_error() {
     assert!(cross_found, "should find a cross-shard key pair among 32 keys");
 
     let _ = child.kill();
+}
+
+#[test]
+fn info_reports_process_wide_shard_metrics() {
+    let port = 16385u16;
+    let mut child = start_server(port, 2, 4);
+    thread::sleep(Duration::from_millis(500));
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok();
+
+    for i in 0..128 {
+        let key = format!("metric_key_{i}");
+        stream
+            .write_all(resp_cmd(&["SET", &key, "value"]).as_bytes())
+            .expect("write set");
+        let response = read_resp(&mut stream);
+        assert!(response.contains("OK"), "set {key}: {response}");
+    }
+
+    stream
+        .write_all(resp_cmd(&["INFO", "STATS"]).as_bytes())
+        .expect("write info stats");
+    let stats = read_resp(&mut stream);
+    let mut shard_commands = Vec::new();
+    for shard_id in 0..4 {
+        let name = format!("rudis_shard_{shard_id}_commands");
+        shard_commands.push(info_metric(&stats, &name));
+    }
+    assert_eq!(
+        shard_commands.iter().sum::<u64>(),
+        info_metric(&stats, "total_commands_processed")
+    );
+    assert!(
+        shard_commands.iter().filter(|&&count| count > 0).count() >= 2,
+        "expected commands on multiple shards: {shard_commands:?}"
+    );
+
+    stream
+        .write_all(resp_cmd(&["INFO", "KEYSPACE"]).as_bytes())
+        .expect("write info keyspace");
+    let keyspace = read_resp(&mut stream);
+    assert!(
+        keyspace.contains("db0:keys=128,expires=0"),
+        "unexpected keyspace metrics: {keyspace}"
+    );
+
+    let _ = child.kill();
+}
+
+fn info_metric(response: &str, name: &str) -> u64 {
+    response
+        .split("\r\n")
+        .find_map(|line| {
+            let (field, value) = line.split_once(':')?;
+            (field == name).then(|| value.parse().expect("numeric INFO metric"))
+        })
+        .unwrap_or_else(|| panic!("missing INFO metric {name}: {response}"))
 }

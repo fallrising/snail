@@ -15,7 +15,7 @@ pub struct TestServer {
 impl TestServer {
     pub fn start() -> Self {
         let port = PORT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let child = Command::new("./target/release/rudis")
+        let child = Command::new(env!("CARGO_BIN_EXE_rudis"))
             .args([
                 "--port",
                 &port.to_string(),
@@ -31,7 +31,7 @@ impl TestServer {
     }
 
     pub fn connect(&self) -> TcpStream {
-        let mut stream =
+        let stream =
             TcpStream::connect(format!("127.0.0.1:{}", self.port)).expect("connect");
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(2))).ok();

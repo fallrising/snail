@@ -34,7 +34,7 @@ redis-cli -p 6379 get foo       # "bar"
 跑測試：
 
 ```bash
-cargo test   # 18 tests
+cargo test   # 21 tests
 ```
 
 ## Architecture
@@ -52,6 +52,7 @@ Kernel SO_REUSEPORT → Worker × N (pin to core)
 - **thread-per-core share-nothing**：每 shard 獨占一 worker，熱路徑零鎖
 - **跨 shard**：MPSC channel + oneshot scatter-gather，backpressure 逐級傳導
 - **Pipeline**：FIFO 保序，本地/遠端命令可並發完成、按序回覆
+- **Telemetry**：`INFO STATS` 暴露全局與 per-shard commands / keys / expires / memory
 
 ## Supported commands (M1)
 
@@ -128,7 +129,7 @@ C10K 驗收口徑：10K 全活躍、GET/SET 8:2、無 pipeline、p99 < 5ms、零
 ```bash
 cargo build          # debug
 cargo build --release
-cargo test           # 18 tests
+cargo test           # 21 tests
 ```
 
 ### Project layout
@@ -147,8 +148,7 @@ snail/
 ### Next steps
 
 1. 每 worker 連線反應器（C10K p99 達標關鍵）
-2. per-shard ops 指標 + 負載均衡驗證
-3. M2 承壓層（buffer 歸還、優雅停機、C100K）
+2. M2 承壓層（buffer 歸還、優雅停機、C100K）
 
 ## License
 

@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::protocol::frame::Reply;
 use crate::storage::shard::Shard;
 
-pub fn apply_del(shard: &mut Shard, keys: &[Bytes], now_ms: u64) -> Reply {
+pub fn apply_del(shard: &mut Shard, keys: &[Bytes], _now_ms: u64) -> Reply {
     shard.stats.record_command();
     let mut n = 0i64;
     for k in keys {

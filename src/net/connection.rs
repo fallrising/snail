@@ -4,20 +4,20 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use bytes::{BytesMut, BufMut};
+use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 use crate::command::dispatcher::Dispatcher;
 use crate::command::parse;
-use crate::error::{command_err_reply, protocol_err_reply, CommandError, ProtocolError};
+use crate::error::{protocol_err_reply, CommandError, ProtocolError};
 use crate::net::buffer::BufferPool;
 use crate::protocol::encoder;
 use crate::protocol::frame::Reply;
 use crate::protocol::parser::Parser;
 use crate::runtime::router::{ShardClient, ShardMap};
-use crate::runtime::worker::{current_ms, WorkerContext};
+use crate::runtime::worker::current_ms;
 use crate::storage::shard::Shard;
 use crate::telemetry::ServerInfo;
 
@@ -39,7 +39,6 @@ struct ReplySlot {
 
 enum ConnState {
     Normal,
-    Draining,
     CloseAfterFlush,
 }
 
@@ -146,7 +145,7 @@ impl Connection {
     }
 
     fn can_read(&self) -> bool {
-        !matches!(self.state, ConnState::Draining | ConnState::CloseAfterFlush)
+        !matches!(self.state, ConnState::CloseAfterFlush)
             && self.bytes_pending < self.ctx.config.out_buf_soft
             && self.pending.len() < self.ctx.config.pipeline_cap
     }
@@ -156,7 +155,6 @@ impl Connection {
             ConnState::CloseAfterFlush if self.out_buf.is_empty() && self.pending.is_empty() => {
                 true
             }
-            ConnState::Draining if self.pending.is_empty() && self.out_buf.is_empty() => true,
             _ => false,
         }
     }

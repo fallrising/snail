@@ -1,6 +1,3 @@
-use std::collections::{BTreeMap, HashMap};
-
-use ahash::RandomState;
 use bytes::Bytes;
 
 use crate::command::{parse_f64_arg, parse_i64_arg, Command, CommandError, ScoreBound, ZAddOptions};

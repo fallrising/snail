@@ -7,8 +7,6 @@ use crate::protocol::frame::Reply;
 use crate::storage::shard::{Entry, Shard};
 use crate::storage::value::Value;
 
-use super::string::{normalize_index, slice_str};
-
 pub fn apply_lpush(
     shard: &mut Shard,
     key: Bytes,
@@ -31,7 +29,6 @@ pub fn apply_lpush(
             _ => return wrongtype(),
         },
     };
-    let added = values.len() as i64;
     for v in values {
         if front {
             list.push_front(v);
@@ -54,10 +51,6 @@ pub fn apply_lpush(
         },
     );
     Reply::Int(len)
-}
-
-fn list_len_after(_added: i64, _front: bool, _shard: &Shard, _key: &Bytes, _now: u64) -> Option<i64> {
-    None
 }
 
 pub fn apply_lpop(

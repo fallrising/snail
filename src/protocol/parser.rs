@@ -22,7 +22,6 @@ enum State {
     BulkLen,
     BulkData,
     Inline,
-    Err,
 }
 
 impl Parser {
@@ -70,11 +69,8 @@ impl Parser {
                     self.state = State::BulkLen;
                 }
                 State::BulkLen => {
-                    if buf.is_empty() || buf[0] != b'$' {
-                        return Err(ProtocolError::InvalidPrefix(buf.first().copied().unwrap_or(0)));
-                    }
-                    buf.advance(1);
-                    let (len, consumed) = read_usize_line(buf, config.max_bulk_len, "bulk")?;
+                    let (len, consumed) =
+                        read_prefixed_usize_line(buf, b'$', config.max_bulk_len, "bulk")?;
                     if !consumed {
                         return Ok(None);
                     }
@@ -130,7 +126,6 @@ impl Parser {
                     }
                     return Ok(None);
                 }
-                State::Err => return Err(ProtocolError::Incomplete),
             }
         }
     }
@@ -152,7 +147,10 @@ fn read_usize_line(
     let Some(pos) = pos else {
         return Ok((0, false));
     };
-    if pos + 1 >= buf.len() || buf[pos + 1] != b'\n' {
+    if pos + 1 >= buf.len() {
+        return Ok((0, false));
+    }
+    if buf[pos + 1] != b'\n' {
         return Err(ProtocolError::MissingCrlf);
     }
     let line = &buf[..pos];
@@ -174,6 +172,34 @@ fn read_usize_line(
     }
     buf.advance(pos + 2);
     Ok((val, true))
+}
+
+fn read_prefixed_usize_line(
+    buf: &mut BytesMut,
+    prefix: u8,
+    max: usize,
+    kind: &'static str,
+) -> Result<(usize, bool), ProtocolError> {
+    if buf.is_empty() {
+        return Ok((0, false));
+    }
+    if buf[0] != prefix {
+        return Err(ProtocolError::InvalidPrefix(buf[0]));
+    }
+
+    let Some(relative_pos) = buf[1..].iter().position(|&b| b == b'\r') else {
+        return Ok((0, false));
+    };
+    let line_end = relative_pos + 1;
+    if line_end + 1 >= buf.len() {
+        return Ok((0, false));
+    }
+    if buf[line_end + 1] != b'\n' {
+        return Err(ProtocolError::MissingCrlf);
+    }
+
+    buf.advance(1);
+    read_usize_line(buf, max, kind)
 }
 
 #[cfg(test)]
@@ -200,5 +226,27 @@ mod tests {
         let mut buf = BytesMut::from("ping\r\n");
         let frame = p.next_frame(&mut buf, &cfg()).unwrap().unwrap();
         assert_eq!(frame.args[0].as_ref(), b"ping");
+    }
+
+    #[test]
+    fn parses_resp_one_byte_at_a_time() {
+        let input = b"*3\r\n$3\r\nSET\r\n$13\r\nmetric_key_93\r\n$5\r\nvalue\r\n";
+        let mut parser = Parser::new();
+        let mut buf = BytesMut::new();
+        let mut parsed = None;
+
+        for byte in input {
+            buf.extend_from_slice(&[*byte]);
+            if let Some(frame) = parser.next_frame(&mut buf, &cfg()).unwrap() {
+                parsed = Some(frame);
+            }
+        }
+
+        let frame = parsed.expect("complete frame");
+        assert_eq!(frame.args.len(), 3);
+        assert_eq!(frame.args[0].as_ref(), b"SET");
+        assert_eq!(frame.args[1].as_ref(), b"metric_key_93");
+        assert_eq!(frame.args[2].as_ref(), b"value");
+        assert!(buf.is_empty());
     }
 }

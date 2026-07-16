@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,7 +78,7 @@ async fn run_worker(
     config: Arc<Config>,
     shard_map: Arc<ShardMap>,
     shard_client: ShardClient,
-    mut request_rx: mpsc::Receiver<ShardRequest>,
+    request_rx: mpsc::Receiver<ShardRequest>,
     conn_count: Arc<AtomicUsize>,
     hash_seed: u64,
     info: Arc<ServerInfo>,
@@ -86,7 +86,11 @@ async fn run_worker(
     let range = shard_map.shards_for_worker(worker_id);
     let mut shards = Vec::new();
     for id in range.clone() {
-        shards.push(Shard::new(id, hash_seed.wrapping_add(id as u64)));
+        shards.push(Shard::new(
+            id,
+            hash_seed.wrapping_add(id as u64),
+            info.shard_stats(id),
+        ));
     }
 
     let config_rc = Rc::new((*config).clone());
@@ -146,11 +150,6 @@ async fn executor_loop(
             let _ = req.reply.send(reply);
         }
     }
-}
-
-fn req_local_shard(cmd: &crate::command::Command, range: &std::ops::Range<usize>) -> usize {
-    let _ = cmd;
-    range.start.min(range.end.saturating_sub(1))
 }
 
 async fn expire_ticker(

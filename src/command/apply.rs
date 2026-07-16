@@ -186,7 +186,7 @@ pub fn apply(shard: &mut Shard, cmd: Command, now_ms: u64, config: &Config, info
         Command::HKeys(k) => match hash::apply_hgetall(shard, &k, now_ms) {
             Reply::Array(mut pairs) => {
                 let mut keys = Vec::new();
-                let mut i = 0;
+                let i = 0;
                 while i < pairs.len() {
                     keys.push(pairs.remove(i));
                     if i < pairs.len() {
@@ -200,7 +200,7 @@ pub fn apply(shard: &mut Shard, cmd: Command, now_ms: u64, config: &Config, info
         Command::HVals(k) => match hash::apply_hgetall(shard, &k, now_ms) {
             Reply::Array(mut pairs) => {
                 let mut vals = Vec::new();
-                let mut i = 0;
+                let i = 0;
                 while i < pairs.len() {
                     pairs.remove(i);
                     if i < pairs.len() {
