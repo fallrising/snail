@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use ahash::RandomState;
@@ -73,6 +74,10 @@ impl ShardMap {
     pub fn num_shards(&self) -> usize {
         self.num_shards
     }
+
+    pub fn num_workers(&self) -> usize {
+        self.num_workers
+    }
 }
 
 #[derive(Clone)]
@@ -81,25 +86,38 @@ pub struct ShardClient {
     shard_map: Arc<ShardMap>,
     /// Per-worker mio wakers — set once each reactor starts (lock-free reads).
     wakers: Arc<Vec<OnceLock<Arc<mio::Waker>>>>,
+    /// Coalesce wakes: only the first enqueue since last drain calls `wake()`.
+    wake_pending: Arc<Vec<AtomicBool>>,
 }
 
 impl ShardClient {
     pub fn new(senders: Arc<Vec<mpsc::Sender<ShardRequest>>>, shard_map: Arc<ShardMap>) -> Self {
         let n = senders.len();
         let mut wakers = Vec::with_capacity(n);
+        let mut wake_pending = Vec::with_capacity(n);
         for _ in 0..n {
             wakers.push(OnceLock::new());
+            wake_pending.push(AtomicBool::new(false));
         }
         Self {
             senders,
             shard_map,
             wakers: Arc::new(wakers),
+            wake_pending: Arc::new(wake_pending),
         }
     }
 
     pub fn register_waker(&self, worker_id: usize, waker: Arc<mio::Waker>) {
         if worker_id < self.wakers.len() {
             let _ = self.wakers[worker_id].set(waker);
+        }
+    }
+
+    /// Call before draining the worker's shard inbox so subsequent sends wake again.
+    #[inline]
+    pub fn clear_wake(&self, worker_id: usize) {
+        if let Some(flag) = self.wake_pending.get(worker_id) {
+            flag.store(false, Ordering::Release);
         }
     }
 
@@ -113,8 +131,11 @@ impl ShardClient {
         };
         let sender = &self.senders[worker];
         let _ = sender.try_send(req);
-        if let Some(w) = self.wakers[worker].get() {
-            let _ = w.wake();
+        // First enqueue since last clear_wake → wake the owner reactor once.
+        if !self.wake_pending[worker].swap(true, Ordering::AcqRel) {
+            if let Some(w) = self.wakers[worker].get() {
+                let _ = w.wake();
+            }
         }
         rx
     }

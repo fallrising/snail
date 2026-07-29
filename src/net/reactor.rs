@@ -73,6 +73,7 @@ pub async fn run(
         }
 
         // 1) Apply inbound shard requests (folded executor).
+        ctx.shard_client.clear_wake(ctx.worker_id);
         drain_shard_requests(
             &mut request_rx,
             &ctx.local_shards,
@@ -128,6 +129,7 @@ pub async fn run(
         }
 
         let mut did_work = false;
+        let mut woke_for_shards = false;
         for event in events.iter() {
             did_work = true;
             match event.token() {
@@ -142,7 +144,10 @@ pub async fn run(
                         &pool,
                     );
                 }
-                TOKEN_LISTENER | TOKEN_WAKE => {}
+                TOKEN_WAKE => {
+                    woke_for_shards = true;
+                }
+                TOKEN_LISTENER => {}
                 token => {
                     let idx = token.0.saturating_sub(CONN_TOKEN_BASE);
                     if idx >= conns.len() || conns[idx].is_none() {
@@ -166,38 +171,27 @@ pub async fn run(
             }
         }
 
-        // 5) Harvest async replies only for known waiters (not O(conns)).
-        let mut wi = 0;
-        while wi < async_waiters.len() {
-            let idx = async_waiters[wi];
-            let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
-                async_waiters.swap_remove(wi);
-                continue;
-            };
-            if !conn.has_pending_async() {
-                conn.in_async_list = false;
-                async_waiters.swap_remove(wi);
-                continue;
-            }
-            if conn.poll_async() {
-                did_work = true;
-                let closed = matches!(conn.drive(false, true), DriveResult::Closed);
-                if closed {
-                    remove_conn(&mut poll, &mut conns, &mut free, idx);
-                    async_waiters.swap_remove(wi);
-                    continue;
-                }
-                if let Some(conn) = conns[idx].as_mut() {
-                    reregister(&mut poll, conn);
-                    if !conn.has_pending_async() {
-                        conn.in_async_list = false;
-                        async_waiters.swap_remove(wi);
-                        continue;
-                    }
-                }
-            }
-            wi += 1;
+        // Remote workers may have enqueued work; apply before harvesting oneshots.
+        if woke_for_shards {
+            ctx.shard_client.clear_wake(ctx.worker_id);
+            drain_shard_requests(
+                &mut request_rx,
+                &ctx.local_shards,
+                &ctx.config,
+                &ctx.info,
+                &ctx.now_ms,
+                &shard_range,
+            );
         }
+
+        // 5) Harvest async replies only for known waiters (not O(conns)).
+        harvest_async_waiters(
+            &mut poll,
+            &mut conns,
+            &mut free,
+            &mut async_waiters,
+            &mut did_work,
+        );
 
         // 6) Drain complete?
         if !accepting {
@@ -220,7 +214,7 @@ pub async fn run(
             }
         }
 
-        // 7) Yield only when multi-gather / oneshot tasks need the LocalSet.
+        // 7) Yield when oneshots need peer reactors / LocalSet.
         if !async_waiters.is_empty() {
             tokio::task::yield_now().await;
             continue;
@@ -236,6 +230,7 @@ pub async fn run(
             }
             // Process any events that arrived during the blocking wait before looping
             // back through shard/expire bookkeeping.
+            let mut woke_for_shards = false;
             for event in events.iter() {
                 match event.token() {
                     TOKEN_LISTENER if accepting => {
@@ -249,7 +244,10 @@ pub async fn run(
                             &pool,
                         );
                     }
-                    TOKEN_LISTENER | TOKEN_WAKE => {}
+                    TOKEN_WAKE => {
+                        woke_for_shards = true;
+                    }
+                    TOKEN_LISTENER => {}
                     token => {
                         let idx = token.0.saturating_sub(CONN_TOKEN_BASE);
                         if idx >= conns.len() || conns[idx].is_none() {
@@ -272,7 +270,58 @@ pub async fn run(
                     }
                 }
             }
+            if woke_for_shards {
+                ctx.shard_client.clear_wake(ctx.worker_id);
+                drain_shard_requests(
+                    &mut request_rx,
+                    &ctx.local_shards,
+                    &ctx.config,
+                    &ctx.info,
+                    &ctx.now_ms,
+                    &shard_range,
+                );
+            }
         }
+    }
+}
+
+fn harvest_async_waiters(
+    poll: &mut Poll,
+    conns: &mut Vec<Option<Connection>>,
+    free: &mut Vec<usize>,
+    async_waiters: &mut Vec<usize>,
+    did_work: &mut bool,
+) {
+    let mut wi = 0;
+    while wi < async_waiters.len() {
+        let idx = async_waiters[wi];
+        let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
+            async_waiters.swap_remove(wi);
+            continue;
+        };
+        if !conn.has_pending_async() {
+            conn.in_async_list = false;
+            async_waiters.swap_remove(wi);
+            continue;
+        }
+        if conn.poll_async() {
+            *did_work = true;
+            let closed = matches!(conn.drive(false, true), DriveResult::Closed);
+            if closed {
+                remove_conn(poll, conns, free, idx);
+                async_waiters.swap_remove(wi);
+                continue;
+            }
+            if let Some(conn) = conns[idx].as_mut() {
+                reregister(poll, conn);
+                if !conn.has_pending_async() {
+                    conn.in_async_list = false;
+                    async_waiters.swap_remove(wi);
+                    continue;
+                }
+            }
+        }
+        wi += 1;
     }
 }
 
@@ -284,20 +333,21 @@ fn drain_shard_requests(
     now_ms: &Rc<RefCell<u64>>,
     range: &std::ops::Range<usize>,
 ) {
+    let Ok(req0) = rx.try_recv() else {
+        return;
+    };
+    let now = *now_ms.borrow();
+    let mut guard = shards.borrow_mut();
+    let len = guard.len();
+    let apply_one = |guard: &mut Vec<Shard>, req: ShardRequest| {
+        let local_idx = req.shard_id.saturating_sub(range.start);
+        let shard = &mut guard[local_idx.min(len.saturating_sub(1))];
+        let reply = apply::apply(shard, req.cmd, now, config, info);
+        let _ = req.reply.send(reply);
+    };
+    apply_one(&mut guard, req0);
     while let Ok(req) = rx.try_recv() {
-        let mut batch = vec![req];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
-        }
-        let now = *now_ms.borrow();
-        let mut guard = shards.borrow_mut();
-        for req in batch {
-            let local_idx = req.shard_id.saturating_sub(range.start);
-            let len = guard.len();
-            let shard = &mut guard[local_idx.min(len.saturating_sub(1))];
-            let reply = apply::apply(shard, req.cmd, now, config, info);
-            let _ = req.reply.send(reply);
-        }
+        apply_one(&mut guard, req);
     }
 }
 
