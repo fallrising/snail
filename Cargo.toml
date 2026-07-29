@@ -26,6 +26,7 @@ toml = "0.7"
 rand = "0.8"
 libc = "0.2"
 indexmap = "=2.2.6"
+mio = { version = "1", features = ["net", "os-poll"] }
 
 
 

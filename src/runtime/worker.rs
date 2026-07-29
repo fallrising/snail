@@ -4,10 +4,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::LocalSet;
 
-use crate::command::apply;
 use crate::config::Config;
 use crate::net::listener;
 use crate::runtime::router::{ShardClient, ShardMap, ShardRequest};
@@ -34,6 +33,7 @@ pub fn spawn_worker(
     conn_count: Arc<AtomicUsize>,
     hash_seed: u64,
     info: Arc<ServerInfo>,
+    shutdown_rx: broadcast::Receiver<()>,
 ) -> std::thread::JoinHandle<()> {
     let cores = core_affinity::get_core_ids().unwrap_or_default();
     let pin_core = config
@@ -65,6 +65,7 @@ pub fn spawn_worker(
                         conn_count,
                         hash_seed,
                         info,
+                        shutdown_rx,
                     )
                     .await;
                 })
@@ -82,6 +83,7 @@ async fn run_worker(
     conn_count: Arc<AtomicUsize>,
     hash_seed: u64,
     info: Arc<ServerInfo>,
+    shutdown_rx: broadcast::Receiver<()>,
 ) {
     let range = shard_map.shards_for_worker(worker_id);
     let mut shards = Vec::new();
@@ -100,74 +102,18 @@ async fn run_worker(
 
     let ctx = WorkerContext {
         worker_id,
-        config: config_rc.clone(),
-        shard_map: shard_map.clone(),
-        shard_client: shard_client.clone(),
-        local_shards: local_shards.clone(),
-        info: info_rc.clone(),
-        conn_count: conn_count.clone(),
-        now_ms: now_ms.clone(),
+        config: config_rc,
+        shard_map,
+        shard_client,
+        local_shards,
+        info: info_rc,
+        conn_count,
+        now_ms,
     };
 
-    tokio::task::spawn_local(executor_loop(
-        request_rx,
-        local_shards.clone(),
-        config_rc.clone(),
-        info_rc.clone(),
-        now_ms.clone(),
-        range,
-    ));
-
-    tokio::task::spawn_local(expire_ticker(
-        local_shards.clone(),
-        config_rc.clone(),
-        now_ms.clone(),
-    ));
-
-    listener::accept_loop(ctx).await;
-}
-
-async fn executor_loop(
-    mut rx: mpsc::Receiver<ShardRequest>,
-    shards: Rc<RefCell<Vec<Shard>>>,
-    config: Rc<Config>,
-    info: Rc<ServerInfo>,
-    now_ms: Rc<RefCell<u64>>,
-    range: std::ops::Range<usize>,
-) {
-    while let Some(req) = rx.recv().await {
-        let mut batch = vec![req];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
-        }
-        let now = *now_ms.borrow();
-        let mut guard = shards.borrow_mut();
-        for req in batch {
-            let local_idx = req.shard_id.saturating_sub(range.start);
-            let len = guard.len();
-            let shard = &mut guard[local_idx.min(len.saturating_sub(1))];
-            let reply = apply::apply(shard, req.cmd, now, &config, &info);
-            let _ = req.reply.send(reply);
-        }
-    }
-}
-
-async fn expire_ticker(
-    shards: Rc<RefCell<Vec<Shard>>>,
-    config: Rc<Config>,
-    now_ms: Rc<RefCell<u64>>,
-) {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_millis(config.expire_interval_ms));
-    loop {
-        interval.tick().await;
-        *now_ms.borrow_mut() = current_ms();
-        let now = *now_ms.borrow();
-        let mut guard = shards.borrow_mut();
-        for shard in guard.iter_mut() {
-            shard.active_expire(now, config.expire_budget);
-        }
-    }
+    // Shard apply + expire are folded into the mio reactor; LocalSet remains for
+    // multi-gather `spawn_local` in the dispatcher.
+    listener::accept_loop(ctx, request_rx, range, shutdown_rx).await;
 }
 
 pub fn current_ms() -> u64 {

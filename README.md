@@ -10,7 +10,7 @@ Rust in-memory **Redis-compatible** server speaking **RESP2 over TCP**.
 |---|---|
 | M0 Skeleton | Done |
 | M1 Full semantics + multi-core | In progress (~90%) |
-| M2 Pressure layer (C100K) | In progress (reactor + buffer return + maxclients) |
+| M2 Pressure layer (C100K) | In progress (mio reactor + graceful shutdown) |
 | M3 Limits (C1M) | Planned |
 
 詳細進度、已知限制與下一步計畫見 [docs/STATUS.md](docs/STATUS.md)。  
@@ -34,7 +34,7 @@ redis-cli -p 6379 get foo       # "bar"
 跑測試：
 
 ```bash
-cargo test   # 27 tests
+cargo test   # 28 tests
 ```
 
 ## Architecture
@@ -43,10 +43,10 @@ cargo test   # 27 tests
 Clients (RESP2 / pipeline)
     ↓  TCP
 Kernel SO_REUSEPORT → Worker × N (pin to core)
-    ├── Conn Reactor (accept + poll-drive all conns)
-    ├── Shard Executor (MPSC, sync apply)
-    ├── Shard × M (dict + expire index, lock-free)
-    └── Expire Ticker (100ms)
+    ├── mio/epoll Reactor (accept + ready-FD drive)
+    ├── Shard apply (folded into reactor, MPSC try_recv)
+    ├── Shard × M (dict + expire index)
+    └── Expire (folded, 100ms)
 ```
 
 - **thread-per-core share-nothing**：每 shard 獨占一 worker，熱路徑零鎖
@@ -122,15 +122,15 @@ sudo ./scripts/sysctl-tuning.sh
 
 C10K 驗收口徑：10K 全活躍、GET/SET 8:2、無 pipeline、p99 < 5ms、零錯誤。
 
-**基線結果**（反應器改寫前，12 workers / 12 shards）：1M 請求、零錯誤、~156K req/s，p99 ≈ 148 ms。  
-反應器落地後請重跑 `./scripts/bench-c10k.sh all` 更新數字。詳見 [docs/STATUS.md](docs/STATUS.md)。
+**基線 / 現況**（mio 反應器後，6 workers）：10K 連線、1M 請求、零錯誤、~120–140K req/s，p99 ≈ 150 ms。  
+64 連線時 p99 ≈ 6 ms。詳見 [docs/STATUS.md](docs/STATUS.md)。
 
 ## Development
 
 ```bash
 cargo build          # debug
 cargo build --release
-cargo test           # 27 tests
+cargo test           # 28 tests
 ```
 
 ### Project layout
@@ -148,8 +148,8 @@ snail/
 
 ### Next steps
 
-1. 重跑 C10K 驗收（反應器改寫後 p99）
-2. M2 承壓層（優雅停機、C100K）
+1. 拉高單機吞吐（C10K p99&lt;5ms 約需 ≥2M req/s）
+2. C100K 連線持有、M3 io_uring / C1M
 
 ## License
 

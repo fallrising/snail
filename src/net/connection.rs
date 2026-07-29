@@ -1,15 +1,13 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::future::Future;
-use std::io::{self, ErrorKind};
-use std::pin::Pin;
+use std::io::{self, ErrorKind, Read, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::BytesMut;
-use tokio::net::TcpStream;
+use mio::net::TcpStream;
+use mio::{Interest, Token};
 use tokio::sync::oneshot;
 
 use crate::command::dispatcher::Dispatcher;
@@ -21,7 +19,6 @@ use crate::protocol::encoder;
 use crate::protocol::frame::Reply;
 use crate::protocol::parser::Parser;
 use crate::runtime::router::{ShardClient, ShardMap};
-use crate::runtime::worker::current_ms;
 use crate::storage::shard::Shard;
 use crate::telemetry::ServerInfo;
 
@@ -48,14 +45,14 @@ enum ConnState {
 }
 
 pub enum DriveResult {
-    /// Still open; register interest and wait.
+    /// Still open.
     Pending,
     /// Closed; drop the connection.
     Closed,
 }
 
 pub struct Connection {
-    stream: TcpStream,
+    pub stream: TcpStream,
     read_buf: BytesMut,
     out_buf: BytesMut,
     parser: Parser,
@@ -64,14 +61,20 @@ pub struct Connection {
     state: ConnState,
     pool: Rc<BufferPool>,
     ctx: ConnContext,
-    /// Rejected at accept (maxclients); flush error then close.
     reject_only: bool,
-    /// Whether this connection was counted in `conn_count`.
     counted: bool,
+    /// Last registered mio interest (for reregister elision).
+    registered: Interest,
+    pub token: Token,
 }
 
 impl Connection {
-    pub fn new(stream: TcpStream, ctx: ConnContext, pool: Rc<BufferPool>) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        ctx: ConnContext,
+        pool: Rc<BufferPool>,
+        token: Token,
+    ) -> Self {
         let _ = stream.set_nodelay(true);
         Self {
             stream,
@@ -85,12 +88,17 @@ impl Connection {
             ctx,
             reject_only: false,
             counted: true,
+            registered: Interest::READABLE,
+            token,
         }
     }
 
-    /// Connection that only writes an error and closes (maxclients).
-    /// Not counted toward `maxclients` / `conn_count`.
-    pub fn rejected(stream: TcpStream, ctx: ConnContext, pool: Rc<BufferPool>) -> Self {
+    pub fn rejected(
+        stream: TcpStream,
+        ctx: ConnContext,
+        pool: Rc<BufferPool>,
+        token: Token,
+    ) -> Self {
         let _ = stream.set_nodelay(true);
         let msg = b"-ERR max number of clients reached\r\n";
         let mut out_buf = BytesMut::with_capacity(64);
@@ -107,19 +115,45 @@ impl Connection {
             ctx,
             reject_only: true,
             counted: false,
+            registered: Interest::WRITABLE,
+            token,
         }
     }
 
-    pub fn poll_drive(&mut self, cx: &mut Context<'_>) -> DriveResult {
-        // Encode any completed async replies, then write-first.
-        let _ = self.poll_harvest(cx);
-
-        match self.poll_flush(cx) {
-            Poll::Ready(Err(_)) => {
-                self.release_buffers();
-                return DriveResult::Closed;
+    pub fn desired_interest(&self) -> Interest {
+        if self.reject_only || !self.out_buf.is_empty() {
+            if self.can_read() {
+                Interest::READABLE | Interest::WRITABLE
+            } else {
+                Interest::WRITABLE
             }
-            Poll::Ready(Ok(_)) | Poll::Pending => {}
+        } else if self.can_read() {
+            Interest::READABLE
+        } else {
+            // Waiting on async replies or backpressure — still watch readability for EOF.
+            Interest::READABLE
+        }
+    }
+
+    pub fn registered_interest(&self) -> Interest {
+        self.registered
+    }
+
+    pub fn set_registered(&mut self, interest: Interest) {
+        self.registered = interest;
+    }
+
+    /// Drive this connection from a mio readiness event (or opportunistic pass).
+    pub fn drive(&mut self, readable: bool, writable: bool) -> DriveResult {
+        let _ = self.try_harvest();
+
+        if writable || !self.out_buf.is_empty() {
+            if let Err(e) = self.try_flush() {
+                if e.kind() != ErrorKind::WouldBlock {
+                    self.release_buffers();
+                    return DriveResult::Closed;
+                }
+            }
         }
 
         if self.should_close() {
@@ -133,31 +167,35 @@ impl Connection {
         }
 
         if self.reject_only {
-            if self.out_buf.is_empty() {
+            return if self.out_buf.is_empty() {
                 self.release_buffers();
-                return DriveResult::Closed;
-            }
-            self.register_interest(cx);
-            return DriveResult::Pending;
+                DriveResult::Closed
+            } else {
+                DriveResult::Pending
+            };
         }
 
-        match self.poll_read(cx) {
-            Poll::Ready(Ok(false)) | Poll::Ready(Err(_)) => {
-                self.release_buffers();
-                return DriveResult::Closed;
-            }
-            Poll::Ready(Ok(true)) => {
-                // Local commands produce immediate replies — encode and flush now.
-                let _ = self.poll_harvest(cx);
-                match self.poll_flush(cx) {
-                    Poll::Ready(Err(_)) => {
-                        self.release_buffers();
-                        return DriveResult::Closed;
+        if readable && self.can_read() {
+            match self.try_read() {
+                Ok(false) => {
+                    self.release_buffers();
+                    return DriveResult::Closed;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    self.release_buffers();
+                    return DriveResult::Closed;
+                }
+                Ok(true) => {
+                    let _ = self.try_harvest();
+                    if let Err(e) = self.try_flush() {
+                        if e.kind() != ErrorKind::WouldBlock {
+                            self.release_buffers();
+                            return DriveResult::Closed;
+                        }
                     }
-                    Poll::Ready(Ok(_)) | Poll::Pending => {}
                 }
             }
-            Poll::Pending => {}
         }
 
         if self.should_close() {
@@ -165,38 +203,32 @@ impl Connection {
             return DriveResult::Closed;
         }
 
-        self.register_interest(cx);
         DriveResult::Pending
     }
 
-    fn register_interest(&mut self, cx: &mut Context<'_>) {
-        if !self.out_buf.is_empty() {
-            let _ = self.stream.poll_write_ready(cx);
-        }
-        if self.can_read() {
-            let _ = self.stream.poll_read_ready(cx);
-        }
-        // Pending oneshots already registered their waker via poll_harvest.
+    /// Opportunistically poll pending oneshots (cross-shard replies).
+    pub fn poll_async(&mut self) -> bool {
+        self.try_harvest()
     }
 
-    fn poll_harvest(&mut self, cx: &mut Context<'_>) -> bool {
+    fn try_harvest(&mut self) -> bool {
         let mut progress = false;
         while let Some(front) = self.pending.front_mut() {
             if front.ready.is_none() {
                 if let Some(rx) = front.pending.as_mut() {
-                    match Pin::new(rx).poll(cx) {
-                        Poll::Ready(Ok(r)) => {
+                    match rx.try_recv() {
+                        Ok(r) => {
                             front.ready = Some(r);
                             front.pending = None;
                         }
-                        Poll::Ready(Err(_)) => {
+                        Err(oneshot::error::TryRecvError::Empty) => break,
+                        Err(oneshot::error::TryRecvError::Closed) => {
                             front.ready = Some(Reply::Err(
                                 crate::protocol::frame::CommandErrKind::Generic,
                                 "shard unavailable".into(),
                             ));
                             front.pending = None;
                         }
-                        Poll::Pending => break,
                     }
                 } else {
                     break;
@@ -217,65 +249,37 @@ impl Connection {
         progress
     }
 
-    /// Returns Ready(Ok(true)) if bytes were written, Ready(Ok(false)) if nothing to write,
-    /// Pending if waiting for writability, Err on fatal write error.
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        if self.out_buf.is_empty() {
-            return Poll::Ready(Ok(false));
-        }
-        match self.stream.poll_write_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-        let mut wrote_any = false;
+    fn try_flush(&mut self) -> io::Result<()> {
         while !self.out_buf.is_empty() {
-            match self.stream.try_write(&self.out_buf) {
-                Ok(0) => break,
+            match self.stream.write(&self.out_buf) {
+                Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "write zero")),
                 Ok(n) => {
                     let _ = self.out_buf.split_to(n);
                     self.bytes_pending = self.bytes_pending.saturating_sub(n);
-                    wrote_any = true;
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    let _ = self.stream.poll_write_ready(cx);
-                    break;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Err(e),
+                Err(e) => return Err(e),
             }
         }
-        Poll::Ready(Ok(wrote_any))
+        Ok(())
     }
 
-    /// Ready(Ok(true)) = read+processed, Ready(Ok(false)) = EOF, Pending = wait.
-    fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        if !self.can_read() {
-            return Poll::Pending;
-        }
-
-        // Ensure we have a buffer (may have been returned to the pool while idle).
+    /// Ok(true) = read data, Ok(false) = EOF.
+    fn try_read(&mut self) -> io::Result<bool> {
         if self.read_buf.capacity() == 0 {
             self.read_buf = self.pool.get(self.ctx.config.read_buf_init);
         }
 
-        match self.stream.poll_read_ready(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {}
-        }
-
+        let mut tmp = [0u8; 16 * 1024];
         let mut read_any = false;
         loop {
-            match self.stream.try_read_buf(&mut self.read_buf) {
+            match self.stream.read(&mut tmp) {
                 Ok(0) => {
-                    if !read_any {
-                        return Poll::Ready(Ok(false));
-                    }
-                    break;
+                    return if read_any { Ok(true) } else { Ok(false) };
                 }
-                Ok(_) => {
+                Ok(n) => {
+                    self.read_buf.extend_from_slice(&tmp[..n]);
                     read_any = true;
-                    *self.ctx.now_ms.borrow_mut() = current_ms();
                     if let Err(e) = self.process_input() {
                         self.enqueue_err(protocol_err_reply(&e));
                         self.state = ConnState::CloseAfterFlush;
@@ -285,21 +289,13 @@ impl Connection {
                         break;
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    let _ = self.stream.poll_read_ready(cx);
-                    break;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
             }
         }
 
         self.maybe_return_read_buf();
-
-        if read_any {
-            Poll::Ready(Ok(true))
-        } else {
-            Poll::Pending
-        }
+        Ok(read_any)
     }
 
     fn maybe_return_read_buf(&mut self) {
@@ -328,6 +324,16 @@ impl Connection {
             }
             _ => false,
         }
+    }
+
+    pub fn force_close_after_flush(&mut self) {
+        self.state = ConnState::CloseAfterFlush;
+    }
+
+    pub fn has_pending_async(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|s| s.ready.is_none() && s.pending.is_some())
     }
 
     fn process_input(&mut self) -> Result<(), ProtocolError> {
@@ -363,10 +369,17 @@ impl Connection {
 
                     match dispatcher.dispatch(cmd) {
                         crate::command::dispatcher::DispatchResult::Immediate(reply) => {
-                            self.pending.push_back(ReplySlot {
-                                ready: Some(reply),
-                                pending: None,
-                            });
+                            // Fast path: no in-flight async replies → encode directly.
+                            if self.pending.is_empty() {
+                                let before = self.out_buf.len();
+                                encoder::encode(&reply, &mut self.out_buf);
+                                self.bytes_pending += self.out_buf.len() - before;
+                            } else {
+                                self.pending.push_back(ReplySlot {
+                                    ready: Some(reply),
+                                    pending: None,
+                                });
+                            }
                         }
                         crate::command::dispatcher::DispatchResult::Pending(rx) => {
                             self.pending.push_back(ReplySlot {
