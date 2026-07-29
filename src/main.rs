@@ -5,6 +5,9 @@ use rudis::runtime::bootstrap;
 use rudis::runtime::shutdown;
 use rudis::telemetry;
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let config = match Config::load() {

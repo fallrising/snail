@@ -140,7 +140,7 @@ pub enum Command {
     ShardGetZSet(Bytes),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetOptions {
     pub ex: Option<i64>,
     pub px: Option<i64>,

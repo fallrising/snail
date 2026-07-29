@@ -12,6 +12,8 @@ use tokio::sync::oneshot;
 
 use crate::command::dispatcher::Dispatcher;
 use crate::command::parse;
+use crate::command::string;
+use crate::command::{Command, SetOptions};
 use crate::config::Config;
 use crate::error::{protocol_err_reply, CommandError, ProtocolError};
 use crate::net::buffer::BufferPool;
@@ -29,6 +31,7 @@ pub struct ConnContext {
     pub shard_map: Arc<ShardMap>,
     pub shard_client: ShardClient,
     pub local_shards: Rc<RefCell<Vec<Shard>>>,
+    pub local_shard_base: usize,
     pub info: Rc<ServerInfo>,
     pub conn_count: Arc<AtomicUsize>,
     pub now_ms: Rc<RefCell<u64>>,
@@ -369,42 +372,102 @@ impl Connection {
                         }
                     };
 
-                    if matches!(cmd, crate::command::Command::Quit) {
-                        self.pending.push_back(ReplySlot {
-                            ready: Some(Reply::Ok),
-                            pending: None,
-                        });
+                    if matches!(cmd, Command::Quit) {
+                        self.enqueue_immediate(Reply::Ok);
                         self.state = ConnState::CloseAfterFlush;
                         return Ok(());
                     }
 
-                    self.dispatcher.now_ms = *self.ctx.now_ms.borrow();
-                    match self.dispatcher.dispatch(cmd) {
-                        crate::command::dispatcher::DispatchResult::Immediate(reply) => {
-                            // Fast path: no in-flight async replies → encode directly.
-                            if self.pending.is_empty() {
-                                let before = self.out_buf.len();
-                                encoder::encode(&reply, &mut self.out_buf);
-                                self.bytes_pending += self.out_buf.len() - before;
-                            } else {
-                                self.pending.push_back(ReplySlot {
-                                    ready: Some(reply),
-                                    pending: None,
-                                });
-                            }
-                        }
+                    // Hot path / normal dispatch. None ⇒ async reply already queued.
+                    if let Some(reply) = self.try_local_fast(cmd) {
+                        self.enqueue_immediate(reply);
+                    }                }
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn try_local_fast(&mut self, cmd: Command) -> Option<Reply> {
+        let now = *self.ctx.now_ms.borrow();
+        match cmd {
+            Command::Ping(None) => Some(Reply::Simple("PONG".into())),
+            Command::Ping(Some(msg)) => Some(Reply::Bulk(msg)),
+            Command::Get(k) => {
+                let shard_id = self.ctx.shard_map.shard_of(&k);
+                if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
+                    // Remote — fall through via dispatcher.
+                    self.dispatcher.now_ms = now;
+                    return match self.dispatcher.dispatch(Command::Get(k)) {
+                        crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                         crate::command::dispatcher::DispatchResult::Pending(rx) => {
                             self.pending.push_back(ReplySlot {
                                 ready: None,
                                 pending: Some(rx),
                             });
+                            None // already queued; signal "handled" differently
                         }
+                    };
+                }
+                let mut shards = self.ctx.local_shards.borrow_mut();
+                let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+                let idx = idx.min(shards.len().saturating_sub(1));
+                Some(string::apply_get(&mut shards[idx], &k, now))
+            }
+            Command::Set(k, v, opts) if opts == SetOptions::default() => {
+                let shard_id = self.ctx.shard_map.shard_of(&k);
+                if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
+                    self.dispatcher.now_ms = now;
+                    return match self.dispatcher.dispatch(Command::Set(k, v, opts)) {
+                        crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
+                        crate::command::dispatcher::DispatchResult::Pending(rx) => {
+                            self.pending.push_back(ReplySlot {
+                                ready: None,
+                                pending: Some(rx),
+                            });
+                            None
+                        }
+                    };
+                }
+                let mut shards = self.ctx.local_shards.borrow_mut();
+                let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+                let idx = idx.min(shards.len().saturating_sub(1));
+                Some(string::apply_set(
+                    &mut shards[idx],
+                    k,
+                    v,
+                    opts,
+                    now,
+                    &self.ctx.config,
+                ))
+            }
+            other => {
+                self.dispatcher.now_ms = now;
+                match self.dispatcher.dispatch(other) {
+                    crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
+                    crate::command::dispatcher::DispatchResult::Pending(rx) => {
+                        self.pending.push_back(ReplySlot {
+                            ready: None,
+                            pending: Some(rx),
+                        });
+                        None
                     }
                 }
-                None => break,
             }
         }
-        Ok(())
+    }
+
+    fn enqueue_immediate(&mut self, reply: Reply) {
+        if self.pending.is_empty() {
+            let before = self.out_buf.len();
+            encoder::encode(&reply, &mut self.out_buf);
+            self.bytes_pending += self.out_buf.len() - before;
+        } else {
+            self.pending.push_back(ReplySlot {
+                ready: Some(reply),
+                pending: None,
+            });
+        }
     }
 
     fn enqueue_err(&mut self, msg: String) {

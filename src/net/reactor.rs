@@ -48,6 +48,7 @@ pub async fn run(
         shard_map: ctx.shard_map.clone(),
         shard_client: ctx.shard_client.clone(),
         local_shards: ctx.local_shards.clone(),
+        local_shard_base: shard_range.start,
         info: ctx.info.clone(),
         conn_count: ctx.conn_count.clone(),
         now_ms: ctx.now_ms.clone(),
