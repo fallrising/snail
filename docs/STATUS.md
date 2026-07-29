@@ -1,17 +1,33 @@
 # rudis 開發狀態
 
-> 最後更新：2026-07-16
+> 最後更新：2026-07-29
 
 ## 里程碑進度
 
 | 里程碑 | 狀態 | 說明 |
 |---|---|---|
 | **M0 骨架** | ✅ 完成 | 單/多 worker、RESP2 解析/編碼、GET/SET/DEL/PING、基本 TCP 服務 |
-| **M1 完整語義 + 多核** | 🟡 進行中（~80%） | 五大結構命令基本齊全；跨 shard 異步路由已完成；C10K p99 未達標 |
-| **M2 承壓層** | 🟡 起步 | 壓測工具就緒；連線反應器、buffer 歸還、優雅停機待做 |
+| **M1 完整語義 + 多核** | 🟡 進行中（~90%） | 五大結構命令齊全；`COMMAND_TABLE` 已補全；跨 shard 路由完成；C10K p99 待重測 |
+| **M2 承壓層** | 🟡 進行中 | 連線反應器、idle buffer 歸還、`maxclients` 錯誤回覆已落地；優雅停機 / C100K 待做 |
 | **M3 極限** | ⬜ 未開始 | io_uring、C1M 持有器、sysctl 定稿 |
 
-## 近期完成（2026-07-13 ~ 2026-07-16）
+## 近期完成（2026-07-29）
+
+### P0 — 每 worker 連線反應器 ✅
+
+- 取代 per-connection `spawn_local`：`src/net/reactor.rs` 單任務驅動 accept + 全部連線
+- 以 `poll_read_ready` / `poll_write_ready` + `try_read` / `try_write` 非阻塞驅動
+- 跨 shard `oneshot` 在反應器內 `poll`，共用同一 waker（無額外 per-conn 任務）
+- 空閒連線 read buffer 歸還 `BufferPool`（C1M 記憶體預算前置）
+- `maxclients` 超限回 `-ERR max number of clients reached` 後關閉
+
+### P1 — M1 收尾 ✅
+
+- `COMMAND_TABLE` 補齊 parse_body 已實作的剩餘命令（LLEN / LPUSHX / SREM / …）
+- 黑盒測試新增：`commands_list` / `commands_set` / `commands_server`（含 maxclients）
+- 測試埠分配改為 pid 分散，避免 cargo 平行跑多個 integration binary 撞埠
+
+## 此前完成（2026-07-13 ~ 2026-07-16）
 
 ### P0 — 架構正確性 ✅
 
@@ -31,7 +47,7 @@
 ### P2 — 併發驗收 🟡
 
 - 新增 `rudis-bench`（tokio 異步 C10K 客戶端）與 `scripts/bench-c10k.sh`
-- C10K 壓測已跑（12 workers / 12 shards）：
+- C10K 壓測已跑（12 workers / 12 shards，**反應器改寫前**）：
 
 | 指標 | 結果 | 目標 |
 |---|---|---|
@@ -80,6 +96,7 @@
 - ZSet：ZADD/ZRANGE/ZRANGEBYSCORE/ZRANK/ZPOPMIN…
 - Keys：DEL/EXPIRE/TTL/SCAN/RENAME（跨 shard CROSSSLOT）…
 - Server：PING/ECHO/HELLO/INFO/DBSIZE/FLUSHDB/CONFIG GET/COMMAND
+- `COMMAND_TABLE` 與 parse_body 對齊（約 100+ 命令）
 
 ### 運行時 (`src/runtime/`)
 
@@ -90,11 +107,12 @@
 
 ### 網路層 (`src/net/`)
 
+- **連線反應器**（每 worker 單任務）：accept + poll-drive 多連線
 - 連線狀態機：讀→解析→派發→保序→寫
 - Pipeline FIFO 保序（I4）
 - 兩級 backpressure（`out_buf_soft` / `out_buf_hard`）
-- 分級 buffer pool（4K / 16K）
-- write-first + `readable().await` 空閒休眠
+- 分級 buffer pool（4K / 16K）+ 空閒 read buffer 歸還
+- `maxclients` 拒絕時寫錯誤再關閉
 
 ## 測試覆蓋
 
@@ -108,13 +126,16 @@
 | `tests/commands_hash.rs` | ✅ |
 | `tests/commands_zset.rs` | ✅ |
 | `tests/commands_keys.rs` | ✅ |
+| `tests/commands_list.rs` | ✅ |
+| `tests/commands_set.rs` | ✅ |
+| `tests/commands_server.rs`（含 maxclients） | ✅ |
 | RESP 逐 byte 增量解析 | ✅ |
 | 相同 deadline 多 key 過期 | ✅ |
 | 多 worker `INFO` shard metrics | ✅ |
-| C10K 壓測（p99 < 5ms） | 🟡 已跑，p99 未達標 |
+| C10K 壓測（p99 < 5ms） | 🟡 反應器已落地，待重跑驗收 |
 
 ```bash
-cargo test   # 目前 21 項全綠
+cargo test   # 目前 27 項全綠
 ```
 
 ## 已知限制與語義差異
@@ -124,31 +145,24 @@ cargo test   # 目前 21 項全綠
 - **I5**：跨 shard 多 key 命令無全局原子性
 - **SCAN**：HashMap 桶位游標，rehash 時可能漏鍵
 - **記憶體統計**：啟發式估算，±20% 誤差
-- **C10K 尾延遲**：每連線一個 `spawn_local` task，10K 連線下協程調度開銷大（p99 ~148ms）
+- **C10K 尾延遲**：反應器已取代 per-conn task；正式 p99 數字待 `bench-c10k.sh` 重跑
 
 ## 下一步（優先級排序）
 
-### P0 — C10K p99 達標（M2 前置）
+### P0 — C10K 驗收
 
-1. **每 worker 連線反應器**：取代 per-connection `spawn_local`，單 epoll 迴圈驅動多連線
+1. 重跑 `scripts/bench-c10k.sh`，確認 p99 < 5ms；必要時再優化反應器熱路徑
 
-### P1 — M1 收尾
+### P1 — M2 承壓層
 
-2. 補齊 `COMMAND_TABLE` 剩餘命令註冊
-3. 更多 `tests/commands/` 覆蓋（list / set / server）
+2. 優雅停機：broadcast → drain → deadline
+3. C100K 連線持有驗收
 
-### P2 — M2 承壓層
+### P2 — M3 極限
 
-4. 空閒連線 read buffer 歸還 pool（C1M 記憶體預算關鍵）
-5. 優雅停機：broadcast → drain → deadline
-6. `maxclients` 超限回 `-ERR max number of clients reached` 後關閉
-7. C100K 連線持有驗收
-
-### P3 — M3 極限
-
-8. `scripts/sysctl-tuning.sh` 定稿（含還原）
-9. 自寫 C1M 連線持有器（PING 心跳 + RTT 統計）
-10. 可選：`io_uring` feature 切換
+4. `scripts/sysctl-tuning.sh` 定稿（含還原）
+5. 自寫 C1M 連線持有器（PING 心跳 + RTT 統計）
+6. 可選：`io_uring` feature 切換
 
 ## 目錄對照
 
@@ -159,7 +173,7 @@ snail/
 │   ├── storage/      # Shard、Value、ExpireIndex
 │   ├── command/      # 命令解析、路由、語義實作
 │   ├── runtime/      # Worker、bootstrap、路由 mesh
-│   ├── net/          # Listener、Connection、BufferPool
+│   ├── net/          # Listener、Reactor、Connection、BufferPool
 │   ├── bin/          # rudis-bench 壓測客戶端
 │   ├── config.rs
 │   ├── error.rs

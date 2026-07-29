@@ -33,6 +33,11 @@ impl Parser {
         *self = Self::new();
     }
 
+    /// True when not mid-frame — safe to return the read buffer to the pool.
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, State::WaitType) && self.args.is_empty() && self.inline_buf.is_empty()
+    }
+
     pub fn next_frame(
         &mut self,
         buf: &mut BytesMut,
