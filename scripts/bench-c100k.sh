@@ -13,13 +13,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HOST="${HOST:-127.0.0.1}"
+HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-6379}"
 CLIENTS="${CLIENTS:-100000}"
 HOLD_SECS="${HOLD_SECS:-30}"
 PING_MS="${PING_MS:-1000}"
 WORKERS="${WORKERS:-0}"
 SHARDS="${SHARDS:-0}"
+# Spread across 127.0.0.1..127.0.0.N to avoid ephemeral-port exhaustion on one dest.
+LOOPBACK_SPREAD="${LOOPBACK_SPREAD:-64}"
 PIDFILE="/tmp/rudis-c100k-${PORT}.pid"
 ULIMIT_TARGET="${ULIMIT_TARGET:-1048576}"
 
@@ -77,12 +79,13 @@ run_hold() {
   echo "==> C100K hold: clients=$CLIENTS hold=${HOLD_SECS}s ping=${PING_MS}ms"
   "$ROOT/target/release/rudis-bench" \
     --hold \
-    --host "$HOST" \
+    --host 127.0.0.1 \
     --port "$PORT" \
     -c "$CLIENTS" \
     --hold-secs "$HOLD_SECS" \
     --ping-interval-ms "$PING_MS" \
-    --connect-batch 1000
+    --connect-batch 2000 \
+    --loopback-spread "$LOOPBACK_SPREAD"
 }
 
 cmd="${1:-all}"

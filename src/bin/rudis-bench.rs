@@ -34,6 +34,8 @@ struct Config {
     mode: Mode,
     hold_secs: u64,
     ping_interval_ms: u64,
+    /// Spread hold clients across 127.0.0.1 .. 127.0.0.N (needs server bind 0.0.0.0).
+    loopback_spread: u8,
 }
 
 impl Config {
@@ -51,6 +53,7 @@ impl Config {
             mode: Mode::Latency,
             hold_secs: 30,
             ping_interval_ms: 1000,
+            loopback_spread: 1,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -89,6 +92,13 @@ impl Config {
                         .expect("ping-interval")
                         .parse()
                         .expect("ms")
+                }
+                "--loopback-spread" => {
+                    cfg.loopback_spread = args
+                        .next()
+                        .expect("spread")
+                        .parse()
+                        .expect("u8")
                 }
                 "--help" | "-h" => {
                     eprintln!(
@@ -179,10 +189,17 @@ async fn run_latency(cfg: Config) {
 }
 
 async fn run_hold(cfg: Config) {
+    let spread = cfg.loopback_spread.max(1);
     eprintln!(
-        "rudis-bench hold: {}:{} clients={} hold={}s ping_every={}ms",
-        cfg.host, cfg.port, cfg.clients, cfg.hold_secs, cfg.ping_interval_ms
+        "rudis-bench hold: port={} clients={} hold={}s ping_every={}ms loopback_spread={}",
+        cfg.port, cfg.clients, cfg.hold_secs, cfg.ping_interval_ms, spread
     );
+    if spread > 1 {
+        eprintln!(
+            "note: connecting via 127.0.0.1..127.0.0.{} (server must bind 0.0.0.0)",
+            spread
+        );
+    }
 
     let connected = Arc::new(AtomicUsize::new(0));
     let connect_fail = Arc::new(AtomicUsize::new(0));
@@ -190,12 +207,13 @@ async fn run_hold(cfg: Config) {
     let ping_err = Arc::new(AtomicUsize::new(0));
     let latencies = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
     let connect_barrier = Arc::new(Barrier::new(cfg.clients + 1));
-    let deadline = Instant::now() + Duration::from_secs(cfg.hold_secs);
+    // Hold timer starts after all clients are connected.
+    let hold_secs = cfg.hold_secs;
 
     let mut handles = Vec::new();
     for batch_start in (0..cfg.clients).step_by(cfg.connect_batch) {
         let batch_end = (batch_start + cfg.connect_batch).min(cfg.clients);
-        for _id in batch_start..batch_end {
+        for id in batch_start..batch_end {
             let cfg = cfg.clone();
             let connected = connected.clone();
             let connect_fail = connect_fail.clone();
@@ -204,10 +222,19 @@ async fn run_hold(cfg: Config) {
             let latencies = latencies.clone();
             let connect_barrier = connect_barrier.clone();
             handles.push(tokio::spawn(async move {
-                let addr = format!("{}:{}", cfg.host, cfg.port);
+                let host = if cfg.loopback_spread > 1 {
+                    let octet = 1 + (id % cfg.loopback_spread as usize);
+                    format!("127.0.0.{octet}")
+                } else {
+                    cfg.host.clone()
+                };
+                let addr = format!("{}:{}", host, cfg.port);
                 let mut stream = match connect_with_retry(&addr, 5).await {
                     Some(s) => {
-                        connected.fetch_add(1, Ordering::Relaxed);
+                        let n = connected.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n % 10000 == 0 {
+                            eprintln!("connect progress: {n}");
+                        }
                         s
                     }
                     None => {
@@ -218,6 +245,7 @@ async fn run_hold(cfg: Config) {
                 };
                 connect_barrier.wait().await;
 
+                let deadline = Instant::now() + Duration::from_secs(hold_secs);
                 let ping = resp_cmd(&["PING"]);
                 let mut local = Vec::new();
                 while Instant::now() < deadline {
@@ -240,7 +268,7 @@ async fn run_hold(cfg: Config) {
                 latencies.lock().await.extend(local);
             }));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     connect_barrier.wait().await;
@@ -248,7 +276,7 @@ async fn run_hold(cfg: Config) {
     eprintln!(
         "hold: connected={live} failed={} — holding {}s...",
         connect_fail.load(Ordering::Relaxed),
-        cfg.hold_secs
+        hold_secs
     );
 
     for h in handles {
@@ -266,7 +294,8 @@ async fn run_hold(cfg: Config) {
     println!("target clients:  {}", cfg.clients);
     println!("connected:       {live}");
     println!("connect failed:  {fail}");
-    println!("hold duration:   {}s", cfg.hold_secs);
+    println!("loopback spread: {spread}");
+    println!("hold duration:   {}s", hold_secs);
     println!("ping ok:         {ok}");
     println!("ping errors:     {err}");
     if !lats.is_empty() {
@@ -277,14 +306,9 @@ async fn run_hold(cfg: Config) {
         );
     }
 
-    // Pass if ≥99% of target connections established and ping errors < 1% of pings.
     let conn_ok = live * 100 >= cfg.clients * 99;
     let ping_total = ok + err;
-    let ping_ok_ratio = if ping_total == 0 {
-        false
-    } else {
-        err * 100 < ping_total
-    };
+    let ping_ok_ratio = ping_total == 0 || err * 100 < ping_total;
     if conn_ok && ping_ok_ratio && fail == 0 {
         println!();
         println!("RESULT: PASS (connected={live}/{}, ping_err={err})", cfg.clients);

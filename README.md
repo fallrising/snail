@@ -109,8 +109,8 @@ rudis \
 # C10K 延遲驗收
 ./scripts/bench-c10k.sh all
 
-# C100K 連線持有（需 ulimit -n 足夠大，建議 ≥ 2×CLIENTS）
-CLIENTS=100000 HOLD_SECS=30 ./scripts/bench-c100k.sh all
+# C100K 連線持有（需 ulimit -n 足夠；用 loopback spread 避開 ephemeral port 上限）
+CLIENTS=100000 LOOPBACK_SPREAD=64 ./scripts/bench-c100k.sh all
 
 # OS 調優（需 root；含還原）
 sudo ./scripts/sysctl-tuning.sh apply
@@ -119,10 +119,10 @@ sudo ./scripts/sysctl-tuning.sh restore
 
 C10K 驗收口徑：10K 全活躍、GET/SET 8:2、無 pipeline、p99 < 5ms、零錯誤。
 
-**現況**（mio 反應器 + 熱路徑優化後）：
-- 64 連線延遲：**p99 ≈ 4.3 ms PASS**
-- 10K 連線 hold：PASS（需足夠 `ulimit -n`）
-- 10K 全活躍延遲：p99 ≈ 150 ms（受吞吐限制，見 STATUS）
+**現況**：
+- **C100K hold：PASS**（`LOOPBACK_SPREAD=64`，bind `0.0.0.0`）
+- 64 連線延遲：約 4–10 ms（視負載）
+- 10K 全活躍延遲：仍受吞吐限制（~150 ms p99）
 
 ## Development
 
