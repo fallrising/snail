@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 
 use ahash::RandomState;
 use bytes::Bytes;
@@ -79,25 +79,27 @@ impl ShardMap {
 pub struct ShardClient {
     senders: Arc<Vec<mpsc::Sender<ShardRequest>>>,
     shard_map: Arc<ShardMap>,
-    /// Per-worker mio wakers — set once each reactor starts.
-    wakers: Arc<Mutex<Vec<Option<Arc<mio::Waker>>>>>,
+    /// Per-worker mio wakers — set once each reactor starts (lock-free reads).
+    wakers: Arc<Vec<OnceLock<Arc<mio::Waker>>>>,
 }
 
 impl ShardClient {
     pub fn new(senders: Arc<Vec<mpsc::Sender<ShardRequest>>>, shard_map: Arc<ShardMap>) -> Self {
         let n = senders.len();
+        let mut wakers = Vec::with_capacity(n);
+        for _ in 0..n {
+            wakers.push(OnceLock::new());
+        }
         Self {
             senders,
             shard_map,
-            wakers: Arc::new(Mutex::new(vec![None; n])),
+            wakers: Arc::new(wakers),
         }
     }
 
     pub fn register_waker(&self, worker_id: usize, waker: Arc<mio::Waker>) {
-        if let Ok(mut guard) = self.wakers.lock() {
-            if worker_id < guard.len() {
-                guard[worker_id] = Some(waker);
-            }
+        if worker_id < self.wakers.len() {
+            let _ = self.wakers[worker_id].set(waker);
         }
     }
 
@@ -111,10 +113,8 @@ impl ShardClient {
         };
         let sender = &self.senders[worker];
         let _ = sender.try_send(req);
-        if let Ok(guard) = self.wakers.lock() {
-            if let Some(Some(w)) = guard.get(worker) {
-                let _ = w.wake();
-            }
+        if let Some(w) = self.wakers[worker].get() {
+            let _ = w.wake();
         }
         rx
     }

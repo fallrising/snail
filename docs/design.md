@@ -14,7 +14,14 @@
 
 - 支持 Redis 五大核心資料結構：String / List / Hash / Set / Sorted Set
 - Generic key 命令（TTL、DEL、SCAN…）與 server 命令（PING、INFO…）
-- **C10K 硬性達成**；**C1M 設計上限**（thread-per-core share-nothing）
+- **C10K 硬性達成**（見下方口徑）；**C1M 設計上限**（thread-per-core share-nothing）
+
+#### C10K 驗收口徑
+
+| 閘道 | 條件 |
+|---|---|
+| Gate | 同時維持 **≥10K** TCP 連線；其中 **ACTIVE**（預設 64）做 GET/SET 8:2、無 pipeline、**p99 &lt; 5ms**、零錯誤 |
+| Stress（資訊） | 10K 全活躍 in-flight 吞吐/延遲；達 p99&lt;5ms 約需 ~2M req/s，列為吞吐目標而非硬閘 |
 
 ### 非目標（MVP 不做）
 

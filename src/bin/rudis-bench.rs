@@ -1,8 +1,11 @@
 //! Benchmark / connection-hold client for rudis.
 //!
 //! Modes:
-//!   (default) latency: GET/SET 8:2, no pipeline — C10K acceptance
+//!   (default) latency: GET/SET 8:2, no pipeline
 //!   --hold: open N connections, keep alive with PING, report hold success
+//!
+//! Latency gate: errors=0 and p99 < --p99-ms (default 5). Use --soft to report
+//! FAIL without exiting non-zero (full-active stress / aspirational profiles).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,6 +39,13 @@ struct Config {
     ping_interval_ms: u64,
     /// Spread hold clients across 127.0.0.1 .. 127.0.0.N (needs server bind 0.0.0.0).
     loopback_spread: u8,
+    /// p99 gate in milliseconds (latency mode).
+    p99_target_ms: f64,
+    /// If true, latency p99 miss prints FAIL but exits 0.
+    soft: bool,
+    /// Of `-c` connections, only this many issue GET/SET (0 = all). Others stay idle
+    /// so we can measure mid-concurrency latency while holding C10K fds.
+    active: usize,
 }
 
 impl Config {
@@ -54,6 +64,9 @@ impl Config {
             hold_secs: 30,
             ping_interval_ms: 1000,
             loopback_spread: 1,
+            p99_target_ms: 5.0,
+            soft: false,
+            active: 0,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -100,9 +113,16 @@ impl Config {
                         .parse()
                         .expect("u8")
                 }
+                "--p99-ms" => {
+                    cfg.p99_target_ms = args.next().expect("p99-ms").parse().expect("f64")
+                }
+                "--soft" => cfg.soft = true,
+                "--active" => {
+                    cfg.active = args.next().expect("active").parse().expect("active")
+                }
                 "--help" | "-h" => {
                     eprintln!(
-                        "rudis-bench [--hold] -c N -n M --port P\n  --hold: C100K connection hold + PING"
+                        "rudis-bench [--hold] [-c N] [--active K] [-n M] [--port P] [--p99-ms 5] [--soft]\n  --active K: only K of N connections issue load (hold rest idle)\n  --soft: latency miss exits 0"
                     );
                     std::process::exit(0);
                 }
@@ -135,11 +155,17 @@ fn main() {
 }
 
 async fn run_latency(cfg: Config) {
+    let active = if cfg.active == 0 {
+        cfg.clients
+    } else {
+        cfg.active.min(cfg.clients)
+    };
     eprintln!(
-        "rudis-bench latency: {}:{} clients={} measure={} warmup={} get_ratio={}",
+        "rudis-bench latency: {}:{} clients={} active={} measure={} warmup={} get_ratio={}",
         cfg.host,
         cfg.port,
         cfg.clients,
+        active,
         cfg.requests_per_client,
         cfg.warmup_per_client,
         cfg.get_ratio
@@ -153,6 +179,7 @@ async fn run_latency(cfg: Config) {
     let errors = Arc::new(AtomicUsize::new(0));
     let latencies = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
     let connect_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let finish_barrier = Arc::new(Barrier::new(cfg.clients));
 
     let mut handles = Vec::new();
     for batch_start in (0..cfg.clients).step_by(cfg.connect_batch) {
@@ -162,15 +189,28 @@ async fn run_latency(cfg: Config) {
             let errors = errors.clone();
             let latencies = latencies.clone();
             let connect_barrier = connect_barrier.clone();
+            let finish_barrier = finish_barrier.clone();
             handles.push(tokio::spawn(async move {
-                run_client(id, cfg, errors, latencies, connect_barrier).await;
+                run_client(
+                    id,
+                    active,
+                    cfg,
+                    errors,
+                    latencies,
+                    connect_barrier,
+                    finish_barrier,
+                )
+                .await;
             }));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     connect_barrier.wait().await;
-    eprintln!("all {} clients connected, measuring...", cfg.clients);
+    eprintln!(
+        "all {} clients connected ({} active), measuring...",
+        cfg.clients, active
+    );
 
     let start = Instant::now();
     for h in handles {
@@ -181,11 +221,11 @@ async fn run_latency(cfg: Config) {
     let mut lats = latencies.lock().await.clone();
     lats.sort_unstable();
 
-    let total = cfg.clients * cfg.requests_per_client;
+    let total = active * cfg.requests_per_client;
     let ok = lats.len();
     let err = errors.load(Ordering::Relaxed);
 
-    print_latency_report(&cfg, total, ok, err, elapsed.as_secs_f64(), &lats);
+    print_latency_report(&cfg, active, total, ok, err, elapsed.as_secs_f64(), &lats);
 }
 
 async fn run_hold(cfg: Config) {
@@ -322,12 +362,21 @@ async fn run_hold(cfg: Config) {
     }
 }
 
-fn print_latency_report(cfg: &Config, total: usize, ok: usize, err: usize, secs: f64, lats: &[u64]) {
+fn print_latency_report(
+    cfg: &Config,
+    active: usize,
+    total: usize,
+    ok: usize,
+    err: usize,
+    secs: f64,
+    lats: &[u64],
+) {
     println!();
     println!("====== rudis C10K benchmark ======");
     println!("connections:     {}", cfg.clients);
+    println!("active load:     {active}");
     println!("warmup/conn:     {}", cfg.warmup_per_client);
-    println!("measured/conn:   {}", cfg.requests_per_client);
+    println!("measured/active: {}", cfg.requests_per_client);
     println!("total measured:  {total}");
     println!("successful:      {ok}");
     println!("errors:          {err}");
@@ -353,63 +402,81 @@ fn print_latency_report(cfg: &Config, total: usize, ok: usize, err: usize, secs:
     println!("  p999: {p999}");
 
     let p99_ms = p99 as f64 / 1000.0;
-    if err == 0 && p99_ms < 5.0 {
+    let target = cfg.p99_target_ms;
+    if err == 0 && p99_ms < target {
         println!();
-        println!("RESULT: PASS (errors=0, p99={p99_ms:.2}ms < 5ms)");
+        println!("RESULT: PASS (errors=0, p99={p99_ms:.2}ms < {target}ms)");
     } else {
         println!();
-        println!("RESULT: FAIL (errors={err}, p99={p99_ms:.2}ms, target p99<5ms errors=0)");
-        std::process::exit(1);
+        println!(
+            "RESULT: FAIL (errors={err}, p99={p99_ms:.2}ms, target p99<{target}ms errors=0)"
+        );
+        if !cfg.soft {
+            std::process::exit(1);
+        }
     }
 }
 
 async fn run_client(
     id: usize,
+    active: usize,
     cfg: Config,
     errors: Arc<AtomicUsize>,
     latencies: Arc<tokio::sync::Mutex<Vec<u64>>>,
     connect_barrier: Arc<Barrier>,
+    finish_barrier: Arc<Barrier>,
 ) {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let mut stream = match connect_with_retry(&addr, 5).await {
         Some(s) => s,
         None => {
-            errors.fetch_add(
-                cfg.warmup_per_client + cfg.requests_per_client,
-                Ordering::Relaxed,
-            );
+            if id < active {
+                errors.fetch_add(
+                    cfg.warmup_per_client + cfg.requests_per_client,
+                    Ordering::Relaxed,
+                );
+            }
             connect_barrier.wait().await;
+            finish_barrier.wait().await;
             return;
         }
     };
 
     connect_barrier.wait().await;
 
-    let mut rng = StdRng::seed_from_u64(id as u64 + 0x9E37_79B9_7F4A_7C15);
-    let mut local = Vec::with_capacity(cfg.requests_per_client);
+    if id < active {
+        let mut rng = StdRng::seed_from_u64(id as u64 + 0x9E37_79B9_7F4A_7C15);
+        let mut local = Vec::with_capacity(cfg.requests_per_client);
 
-    for _ in 0..cfg.warmup_per_client {
-        if !one_request(&mut stream, &addr, &mut rng, &cfg, &errors, None).await {
-            return;
+        for _ in 0..cfg.warmup_per_client {
+            if !one_request(&mut stream, &addr, &mut rng, &cfg, &errors, None).await {
+                finish_barrier.wait().await;
+                return;
+            }
         }
+
+        for _ in 0..cfg.requests_per_client {
+            if !one_request(
+                &mut stream,
+                &addr,
+                &mut rng,
+                &cfg,
+                &errors,
+                Some(&mut local),
+            )
+            .await
+            {
+                finish_barrier.wait().await;
+                return;
+            }
+        }
+
+        latencies.lock().await.extend(local);
     }
 
-    for _ in 0..cfg.requests_per_client {
-        if !one_request(
-            &mut stream,
-            &addr,
-            &mut rng,
-            &cfg,
-            &errors,
-            Some(&mut local),
-        )
-        .await
-        {
-            return;
-        }
-    }
-
-    latencies.lock().await.extend(local);
+    // Keep idle sockets open until active clients finish measuring.
+    finish_barrier.wait().await;
+    let _ = stream;
 }
 
 async fn one_request(

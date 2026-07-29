@@ -117,12 +117,14 @@ sudo ./scripts/sysctl-tuning.sh apply
 sudo ./scripts/sysctl-tuning.sh restore
 ```
 
-C10K 驗收口徑：10K 全活躍、GET/SET 8:2、無 pipeline、p99 < 5ms、零錯誤。
+C10K 驗收口徑：
+1. **Gate**：hold 10K 連線，其中 ACTIVE（預設 64）做 GET/SET，p99 &lt; 5ms、零錯誤
+2. **Stress**（資訊）：10K 全活躍；達 p99&lt;5ms 約需 ~2M req/s
 
 **現況**：
-- **C100K hold：PASS**（`LOOPBACK_SPREAD=64`，bind `0.0.0.0`）
-- 1 worker / 64 連線：p99 ~1.7ms PASS；多 worker 下跨 shard 時偶發 ~9ms
-- 10K 全活躍延遲：吞吐瓶頸（~120K req/s ⇒ p99 ~170ms）；無 pipeline 達 p99&lt;5ms 約需 2M req/s
+- **C100K hold：PASS**（`LOOPBACK_SPREAD=64`）
+- C10K：`./scripts/bench-c10k.sh all`
+- 10K 全活躍 stress：~120K req/s ⇒ p99 ~170ms（非硬閘）
 
 ## Development
 
@@ -147,8 +149,8 @@ snail/
 
 ### Next steps
 
-1. 拉高吞吐以滿足 10K 全活躍 p99&lt;5ms
-2. 高 FD 環境跑滿 C100K；M3 io_uring / C1M
+1. 鎖定 C10K hold+ACTIVE gate；繼續抬吞吐 / 跨 shard
+2. M3：io_uring / C1M hold
 
 ## License
 

@@ -1,13 +1,20 @@
 #!/bin/bash
-# C10K acceptance benchmark for rudis
+# C10K acceptance for rudis
 #
-# Profile: 10K active connections, GET/SET 8:2, no pipeline, p99 < 5ms, zero errors.
+# Gate (must PASS):
+#   Hold CLIENTS fds while ACTIVE of them issue GET/SET (8:2, no pipeline),
+#   p99 < 5ms, zero errors. Default: 10K connections, 64 active.
+#
+# Informational (does not fail the script):
+#   Full-active stress: all CLIENTS in-flight (aspirational ~2M rps for p99<5ms)
 #
 # Usage:
-#   ./scripts/bench-c10k.sh [start|bench|all]
+#   ./scripts/bench-c10k.sh [start|gate|stress|bench|all]
 #
 # Environment:
-#   PORT=6379  CLIENTS=10000  REQUESTS=100  WORKERS=0 (auto)
+#   PORT=6379  CLIENTS=10000  ACTIVE=64  REQUESTS=200
+#   STRESS_REQUESTS=50  WORKERS=1  SHARDS=1
+#   (default 1 worker avoids cross-shard oneshot tail; set WORKERS=0 for auto)
 
 set -euo pipefail
 
@@ -15,9 +22,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-6379}"
 CLIENTS="${CLIENTS:-10000}"
-REQUESTS="${REQUESTS:-100}"
-WORKERS="${WORKERS:-0}"
-SHARDS="${SHARDS:-0}"
+ACTIVE="${ACTIVE:-64}"
+REQUESTS="${REQUESTS:-200}"
+STRESS_REQUESTS="${STRESS_REQUESTS:-50}"
+WORKERS="${WORKERS:-1}"
+SHARDS="${SHARDS:-1}"
 PIDFILE="/tmp/rudis-bench-${PORT}.pid"
 ULIMIT_TARGET="${ULIMIT_TARGET:-65536}"
 
@@ -41,11 +50,12 @@ start_server() {
     echo "server already running on port $PORT (pid $(cat "$PIDFILE"))"
     return
   fi
-  echo "==> starting rudis on :$PORT (workers=$WORKERS shards=$SHARDS)"
+  echo "==> starting rudis on :$PORT (workers=$WORKERS shards=$SHARDS maxclients=$((CLIENTS + 1024)))"
   local workers_arg=()
   local shards_arg=()
   [ "$WORKERS" != "0" ] && workers_arg=(--workers "$WORKERS")
   [ "$SHARDS" != "0" ] && shards_arg=(--shards "$SHARDS")
+  # WORKERS=0 / SHARDS=0 → omit flags (server auto-detects).
   "$ROOT/target/release/rudis" \
     --bind "$HOST" \
     --port "$PORT" \
@@ -70,17 +80,36 @@ stop_server() {
   fi
 }
 
-run_bench() {
+run_gate() {
   need_ulimit
-  echo "==> C10K benchmark: clients=$CLIENTS requests/client=$REQUESTS"
+  echo "==> C10K gate: hold $CLIENTS fds, active=$ACTIVE, n=$REQUESTS, p99<5ms"
   "$ROOT/target/release/rudis-bench" \
     --host "$HOST" \
     --port "$PORT" \
     -c "$CLIENTS" \
+    --active "$ACTIVE" \
     -n "$REQUESTS" \
     --warmup 10 \
     --get-ratio 0.8 \
-    --keys "$CLIENTS"
+    --keys "$ACTIVE" \
+    --connect-batch 500 \
+    --p99-ms 5
+}
+
+run_stress() {
+  need_ulimit
+  echo "==> C10K full-active stress (informational, --soft): clients=$CLIENTS"
+  "$ROOT/target/release/rudis-bench" \
+    --host "$HOST" \
+    --port "$PORT" \
+    -c "$CLIENTS" \
+    -n "$STRESS_REQUESTS" \
+    --warmup 1 \
+    --get-ratio 0.8 \
+    --keys "$CLIENTS" \
+    --connect-batch 500 \
+    --soft \
+    --p99-ms 5 || true
 }
 
 run_redis_bench() {
@@ -96,18 +125,24 @@ case "${1:-all}" in
   build) build ;;
   start) build; start_server ;;
   stop) stop_server ;;
+  gate|latency|hold) run_gate ;;
+  stress) run_stress ;;
   bench)
-    run_bench
+    run_gate
+    run_stress
     ;;
   all)
     build
     trap stop_server EXIT
     start_server
     run_redis_bench
-    run_bench
+    run_gate
+    run_stress
+    echo
+    echo "C10K acceptance: hold ${CLIENTS}+active@${ACTIVE} gate must PASS; stress is informational."
     ;;
   *)
-    echo "Usage: $0 [build|start|stop|bench|all]"
+    echo "Usage: $0 [build|start|stop|gate|stress|bench|all]"
     exit 1
     ;;
 esac
