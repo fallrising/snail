@@ -21,7 +21,22 @@ pub struct Shard {
     pub mem_used: u64,
     pub stats: ShardStats,
     seq_counter: u64,
+    /// Batched telemetry (owner-thread only); flushed every BATCH ops / expire tick.
+    pending_commands: u64,
+    pending_hits: u64,
+    pending_misses: u64,
+    pending_expired: u64,
 }
+
+#[derive(Debug)]
+pub enum GetString {
+    Hit(Bytes),
+    Miss,
+    WrongType,
+    Expired,
+}
+
+const STATS_BATCH: u64 = 64;
 
 impl Shard {
     pub fn new(id: usize, hash_seed: u64, stats: ShardStats) -> Self {
@@ -38,7 +53,54 @@ impl Shard {
             mem_used: 0,
             stats,
             seq_counter: 0,
+            pending_commands: 0,
+            pending_hits: 0,
+            pending_misses: 0,
+            pending_expired: 0,
         }
+    }
+
+    #[inline]
+    pub fn note_command(&mut self) {
+        self.pending_commands += 1;
+        if self.pending_commands >= STATS_BATCH {
+            self.flush_stats();
+        }
+    }
+
+    #[inline]
+    pub fn note_hit(&mut self) {
+        self.pending_hits += 1;
+        if self.pending_hits >= STATS_BATCH {
+            self.flush_stats();
+        }
+    }
+
+    #[inline]
+    pub fn note_miss(&mut self) {
+        self.pending_misses += 1;
+        if self.pending_misses >= STATS_BATCH {
+            self.flush_stats();
+        }
+    }
+
+    #[inline]
+    pub fn note_expired(&mut self) {
+        self.pending_expired += 1;
+        if self.pending_expired >= STATS_BATCH {
+            self.flush_stats();
+        }
+    }
+
+    pub fn flush_stats(&mut self) {
+        self.stats.record_commands(self.pending_commands);
+        self.stats.record_hits(self.pending_hits);
+        self.stats.record_misses(self.pending_misses);
+        self.stats.record_expired_n(self.pending_expired);
+        self.pending_commands = 0;
+        self.pending_hits = 0;
+        self.pending_misses = 0;
+        self.pending_expired = 0;
     }
 
     pub fn len(&self) -> usize {
@@ -58,33 +120,62 @@ impl Shard {
     }
 
     pub fn lookup_live(&mut self, key: &Bytes, now_ms: u64) -> Option<&Entry> {
-        let expired = self
-            .dict
-            .get(key)
-            .and_then(|e| e.expire)
-            .map(|(deadline, _)| deadline <= now_ms)
-            .unwrap_or(false);
+        let expired = match self.dict.get(key) {
+            None => return None,
+            Some(e) => e
+                .expire
+                .map(|(deadline, _)| deadline <= now_ms)
+                .unwrap_or(false),
+        };
         if expired {
             self.remove_key(key);
-            self.stats.record_expired();
+            self.note_expired();
             return None;
         }
         self.dict.get(key)
     }
 
     pub fn lookup_live_mut(&mut self, key: &Bytes, now_ms: u64) -> Option<&mut Entry> {
-        let expired = self
-            .dict
-            .get(key)
-            .and_then(|e| e.expire)
-            .map(|(deadline, _)| deadline <= now_ms)
-            .unwrap_or(false);
+        let expired = match self.dict.get(key) {
+            None => return None,
+            Some(e) => e
+                .expire
+                .map(|(deadline, _)| deadline <= now_ms)
+                .unwrap_or(false),
+        };
         if expired {
             self.remove_key(key);
-            self.stats.record_expired();
+            self.note_expired();
             return None;
         }
         self.dict.get_mut(key)
+    }
+
+    /// Single-lookup GET for strings (hot path).
+    pub fn get_string(&mut self, key: &Bytes, now_ms: u64) -> GetString {
+        let action = match self.dict.get(key) {
+            None => GetString::Miss,
+            Some(e) => {
+                if e.expire
+                    .map(|(deadline, _)| deadline <= now_ms)
+                    .unwrap_or(false)
+                {
+                    GetString::Expired
+                } else {
+                    match &e.value {
+                        Value::Str(v) => GetString::Hit(v.clone()),
+                        _ => GetString::WrongType,
+                    }
+                }
+            }
+        };
+        if matches!(action, GetString::Expired) {
+            self.remove_key(key);
+            self.note_expired();
+            GetString::Miss
+        } else {
+            action
+        }
     }
 
     pub fn contains(&mut self, key: &Bytes, now_ms: u64) -> bool {
@@ -183,10 +274,11 @@ impl Shard {
                 .and_then(|entry| entry.expire)
                 == Some((deadline, seq));
             if is_current && self.remove_key(&key).is_some() {
-                self.stats.record_expired();
+                self.note_expired();
                 removed += 1;
             }
         }
+        self.flush_stats();
         self.publish_gauges();
         removed
     }

@@ -138,6 +138,9 @@ impl Dispatcher {
                 Reply::Array(keys)
             }
             Command::Info(section) => {
+                for shard in self.local_shards.borrow_mut().iter_mut() {
+                    shard.flush_stats();
+                }
                 crate::command::server::build_info(&self.info, section.as_ref())
             }
             other => self.apply_local(0, other),

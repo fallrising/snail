@@ -76,19 +76,16 @@ pub fn parse_getex(args: &[Bytes]) -> Result<Command, CommandError> {
 }
 
 pub fn apply_get(shard: &mut Shard, key: &Bytes, now_ms: u64) -> Reply {
-    shard.stats.record_command();
-    let hit = shard.lookup_live(key, now_ms).map(|entry| match &entry.value {
-        Value::Str(v) => Ok(v.clone()),
-        _ => Err(()),
-    });
-    match hit {
-        Some(Ok(v)) => {
-            shard.stats.record_hit();
+    use crate::storage::shard::GetString;
+    shard.note_command();
+    match shard.get_string(key, now_ms) {
+        GetString::Hit(v) => {
+            shard.note_hit();
             Reply::Bulk(v)
         }
-        Some(Err(())) => err_wrongtype(),
-        None => {
-            shard.stats.record_miss();
+        GetString::WrongType => err_wrongtype(),
+        GetString::Miss | GetString::Expired => {
+            shard.note_miss();
             Reply::NullBulk
         }
     }
@@ -102,21 +99,30 @@ pub fn apply_set(
     now_ms: u64,
     config: &Config,
 ) -> Reply {
-    shard.stats.record_command();
+    shard.note_command();
+    // Hot path: plain SET key value (bench / C10K).
+    if opts == SetOptions::default() {
+        // Avoid Value::Str clone just for sizing: string estimate is len + overhead.
+        let delta = key.len() as u64 + value.len() as u64 + 32;
+        if !shard.check_memory(config.maxmemory, delta) {
+            return err_oom();
+        }
+        shard.write_entry(
+            key,
+            Entry {
+                value: Value::Str(value),
+                expire: None,
+            },
+        );
+        return Reply::Ok;
+    }
+
     let exists = shard.lookup_live(&key, now_ms).is_some();
     if opts.nx && exists {
-        return if opts.get {
-            Reply::NullBulk
-        } else {
-            Reply::NullBulk
-        };
+        return Reply::NullBulk;
     }
     if opts.xx && !exists {
-        return if opts.get {
-            Reply::NullBulk
-        } else {
-            Reply::NullBulk
-        };
+        return Reply::NullBulk;
     }
 
     let old_reply = if opts.get {
@@ -132,7 +138,11 @@ pub fn apply_set(
         return old_reply.unwrap();
     }
 
-    let old_expire = shard.lookup_live(&key, now_ms).and_then(|e| e.expire);
+    let old_expire = if opts.keepttl {
+        shard.lookup_live(&key, now_ms).and_then(|e| e.expire)
+    } else {
+        None
+    };
     let delta = Shard::now_key_size(&key, &Value::Str(value.clone()));
     if !shard.check_memory(config.maxmemory, delta) {
         return err_oom();
@@ -141,13 +151,7 @@ pub fn apply_set(
     let expire = if opts.keepttl {
         old_expire
     } else {
-        deadline_from_opts(
-            opts.ex,
-            opts.px,
-            opts.exat,
-            opts.pxat,
-            now_ms,
-        )
+        deadline_from_opts(opts.ex, opts.px, opts.exat, opts.pxat, now_ms)
     };
 
     let entry = Entry {
@@ -164,7 +168,7 @@ pub fn apply_set(
 }
 
 pub fn apply_incrby(shard: &mut Shard, key: Bytes, delta: i64, now_ms: u64, config: &Config) -> Reply {
-    shard.stats.record_command();
+    shard.note_command();
     let cur = shard.lookup_live(&key, now_ms);
     let (new_val, expire) = match cur {
         None => (delta, None),
@@ -205,7 +209,7 @@ pub fn apply_incrbyfloat(
     now_ms: u64,
     config: &Config,
 ) -> Reply {
-    shard.stats.record_command();
+    shard.note_command();
     let cur = shard.lookup_live(&key, now_ms);
     let (new_val, expire) = match cur {
         None => (delta, None),
@@ -248,7 +252,7 @@ pub fn apply_append(
     now_ms: u64,
     config: &Config,
 ) -> Reply {
-    shard.stats.record_command();
+    shard.note_command();
     let expire = shard.lookup_live(&key, now_ms).and_then(|e| e.expire);
     let new_val = match shard.lookup_live(&key, now_ms) {
         None => suffix,
@@ -278,7 +282,7 @@ pub fn apply_append(
 }
 
 pub fn apply_getrange(shard: &mut Shard, key: &Bytes, start: i64, end: i64, now_ms: u64) -> Reply {
-    shard.stats.record_command();
+    shard.note_command();
     let Some(entry) = shard.lookup_live(key, now_ms) else {
         return Reply::Bulk(Bytes::new());
     };
@@ -297,7 +301,7 @@ pub fn apply_setrange(
     now_ms: u64,
     config: &Config,
 ) -> Reply {
-    shard.stats.record_command();
+    shard.note_command();
     if offset < 0 {
         return Reply::Err(crate::protocol::frame::CommandErrKind::Generic, "offset out of range".into());
     }

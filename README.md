@@ -121,8 +121,8 @@ C10K 驗收口徑：10K 全活躍、GET/SET 8:2、無 pipeline、p99 < 5ms、零
 
 **現況**：
 - **C100K hold：PASS**（`LOOPBACK_SPREAD=64`，bind `0.0.0.0`）
-- 64 連線延遲：約 4–10 ms（視負載）
-- 10K 全活躍延遲：仍受吞吐限制（~150 ms p99）
+- 1 worker / 64 連線：p99 ~1.7ms PASS；多 worker 下跨 shard 時偶發 ~9ms
+- 10K 全活躍延遲：吞吐瓶頸（~120K req/s ⇒ p99 ~170ms）；無 pipeline 達 p99&lt;5ms 約需 2M req/s
 
 ## Development
 

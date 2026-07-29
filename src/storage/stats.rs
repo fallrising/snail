@@ -45,8 +45,34 @@ impl ShardStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_commands(&self, n: u64) {
+        if n != 0 {
+            self.counters
+                .total_commands
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_hits(&self, n: u64) {
+        if n != 0 {
+            self.counters.hits.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_misses(&self, n: u64) {
+        if n != 0 {
+            self.counters.misses.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_expired(&self) {
         self.counters.expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_expired_n(&self, n: u64) {
+        if n != 0 {
+            self.counters.expired.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub fn record_flushed(&self, count: usize) {

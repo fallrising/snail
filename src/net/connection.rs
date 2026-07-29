@@ -70,6 +70,10 @@ pub struct Connection {
     /// Last registered mio interest (for reregister elision).
     registered: Interest,
     pub token: Token,
+    /// Cached: any ReplySlot waiting on a oneshot (cross-shard).
+    async_wait: bool,
+    /// In reactor's async_waiters list (avoid duplicate entries).
+    pub in_async_list: bool,
 }
 
 impl Connection {
@@ -104,6 +108,8 @@ impl Connection {
             counted: true,
             registered: Interest::READABLE,
             token,
+            async_wait: false,
+            in_async_list: false,
         }
     }
 
@@ -141,6 +147,8 @@ impl Connection {
             counted: false,
             registered: Interest::WRITABLE,
             token,
+            async_wait: false,
+            in_async_list: false,
         }
     }
 
@@ -270,6 +278,9 @@ impl Connection {
                 break;
             }
         }
+        if progress {
+            self.refresh_async_wait();
+        }
         progress
     }
 
@@ -319,7 +330,28 @@ impl Connection {
         }
 
         self.maybe_return_read_buf();
+        if read_any {
+            self.set_quickack();
+        }
         Ok(read_any)
+    }
+
+    #[inline]
+    fn set_quickack(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let on: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    self.stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&on) as libc::socklen_t,
+                );
+            }
+        }
     }
 
     fn maybe_return_read_buf(&mut self) {
@@ -355,9 +387,23 @@ impl Connection {
     }
 
     pub fn has_pending_async(&self) -> bool {
-        self.pending
+        self.async_wait
+    }
+
+    fn refresh_async_wait(&mut self) {
+        self.async_wait = self
+            .pending
             .iter()
-            .any(|s| s.ready.is_none() && s.pending.is_some())
+            .any(|s| s.ready.is_none() && s.pending.is_some());
+    }
+
+    #[inline]
+    fn push_async(&mut self, rx: oneshot::Receiver<Reply>) {
+        self.pending.push_back(ReplySlot {
+            ready: None,
+            pending: Some(rx),
+        });
+        self.async_wait = true;
     }
 
     fn process_input(&mut self) -> Result<(), ProtocolError> {
@@ -378,10 +424,11 @@ impl Connection {
                         return Ok(());
                     }
 
-                    // Hot path / normal dispatch. None ⇒ async reply already queued.
+                    // Hot path / normal dispatch. None ⇒ already written or async queued.
                     if let Some(reply) = self.try_local_fast(cmd) {
                         self.enqueue_immediate(reply);
-                    }                }
+                    }
+                }
                 None => break,
             }
         }
@@ -391,28 +438,39 @@ impl Connection {
     fn try_local_fast(&mut self, cmd: Command) -> Option<Reply> {
         let now = *self.ctx.now_ms.borrow();
         match cmd {
-            Command::Ping(None) => Some(Reply::Simple("PONG".into())),
+            Command::Ping(None) => {
+                if self.pending.is_empty() {
+                    self.write_static(encoder::PONG);
+                    None
+                } else {
+                    Some(Reply::Simple("PONG".into()))
+                }
+            }
             Command::Ping(Some(msg)) => Some(Reply::Bulk(msg)),
             Command::Get(k) => {
                 let shard_id = self.ctx.shard_map.shard_of(&k);
                 if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
-                    // Remote — fall through via dispatcher.
                     self.dispatcher.now_ms = now;
                     return match self.dispatcher.dispatch(Command::Get(k)) {
                         crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                         crate::command::dispatcher::DispatchResult::Pending(rx) => {
-                            self.pending.push_back(ReplySlot {
-                                ready: None,
-                                pending: Some(rx),
-                            });
-                            None // already queued; signal "handled" differently
+                            self.push_async(rx);
+                            None
                         }
                     };
                 }
-                let mut shards = self.ctx.local_shards.borrow_mut();
-                let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
-                let idx = idx.min(shards.len().saturating_sub(1));
-                Some(string::apply_get(&mut shards[idx], &k, now))
+                let reply = {
+                    let mut shards = self.ctx.local_shards.borrow_mut();
+                    let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+                    let idx = idx.min(shards.len().saturating_sub(1));
+                    string::apply_get(&mut shards[idx], &k, now)
+                };
+                if self.pending.is_empty() {
+                    self.encode_hot(&reply);
+                    None
+                } else {
+                    Some(reply)
+                }
             }
             Command::Set(k, v, opts) if opts == SetOptions::default() => {
                 let shard_id = self.ctx.shard_map.shard_of(&k);
@@ -421,35 +479,37 @@ impl Connection {
                     return match self.dispatcher.dispatch(Command::Set(k, v, opts)) {
                         crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                         crate::command::dispatcher::DispatchResult::Pending(rx) => {
-                            self.pending.push_back(ReplySlot {
-                                ready: None,
-                                pending: Some(rx),
-                            });
+                            self.push_async(rx);
                             None
                         }
                     };
                 }
-                let mut shards = self.ctx.local_shards.borrow_mut();
-                let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
-                let idx = idx.min(shards.len().saturating_sub(1));
-                Some(string::apply_set(
-                    &mut shards[idx],
-                    k,
-                    v,
-                    opts,
-                    now,
-                    &self.ctx.config,
-                ))
+                let reply = {
+                    let mut shards = self.ctx.local_shards.borrow_mut();
+                    let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+                    let idx = idx.min(shards.len().saturating_sub(1));
+                    string::apply_set(
+                        &mut shards[idx],
+                        k,
+                        v,
+                        opts,
+                        now,
+                        &self.ctx.config,
+                    )
+                };
+                if self.pending.is_empty() {
+                    self.encode_hot(&reply);
+                    None
+                } else {
+                    Some(reply)
+                }
             }
             other => {
                 self.dispatcher.now_ms = now;
                 match self.dispatcher.dispatch(other) {
                     crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                     crate::command::dispatcher::DispatchResult::Pending(rx) => {
-                        self.pending.push_back(ReplySlot {
-                            ready: None,
-                            pending: Some(rx),
-                        });
+                        self.push_async(rx);
                         None
                     }
                 }
@@ -457,11 +517,29 @@ impl Connection {
         }
     }
 
+    #[inline]
+    fn write_static(&mut self, bytes: &'static [u8]) {
+        self.out_buf.extend_from_slice(bytes);
+        self.bytes_pending += bytes.len();
+    }
+
+    /// Encode common hot-path replies without going through `Reply::Simple` formatting.
+    #[inline]
+    fn encode_hot(&mut self, reply: &Reply) {
+        let before = self.out_buf.len();
+        match reply {
+            Reply::Ok => self.out_buf.extend_from_slice(encoder::OK),
+            Reply::NullBulk => self.out_buf.extend_from_slice(encoder::NULL_BULK),
+            Reply::Simple(s) if s == "PONG" => self.out_buf.extend_from_slice(encoder::PONG),
+            Reply::Bulk(b) => encoder::encode_bulk(b, &mut self.out_buf),
+            other => encoder::encode(other, &mut self.out_buf),
+        }
+        self.bytes_pending += self.out_buf.len() - before;
+    }
+
     fn enqueue_immediate(&mut self, reply: Reply) {
         if self.pending.is_empty() {
-            let before = self.out_buf.len();
-            encoder::encode(&reply, &mut self.out_buf);
-            self.bytes_pending += self.out_buf.len() - before;
+            self.encode_hot(&reply);
         } else {
             self.pending.push_back(ReplySlot {
                 ready: Some(reply),

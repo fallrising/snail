@@ -56,6 +56,8 @@ pub async fn run(
 
     let mut conns: Vec<Option<Connection>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
+    // Indices of connections waiting on cross-shard oneshots (avoids O(n) scan).
+    let mut async_waiters: Vec<usize> = Vec::new();
     let mut accepting = true;
     let mut drain_deadline: Option<Instant> = None;
     let mut last_expire = Instant::now();
@@ -154,20 +156,27 @@ pub async fn run(
                     };
                     if closed {
                         remove_conn(&mut poll, &mut conns, &mut free, idx);
-                    } else if let Some(conn) = conns[idx].as_mut() {
-                        reregister(&mut poll, conn);
+                    } else {
+                        track_async_waiter(&mut conns, &mut async_waiters, idx);
+                        if let Some(conn) = conns[idx].as_mut() {
+                            reregister(&mut poll, conn);
+                        }
                     }
                 }
             }
         }
 
-        // 5) Opportunistically harvest async replies (cross-shard / multi-gather).
-        let len = conns.len();
-        for idx in 0..len {
-            let Some(conn) = conns[idx].as_mut() else {
+        // 5) Harvest async replies only for known waiters (not O(conns)).
+        let mut wi = 0;
+        while wi < async_waiters.len() {
+            let idx = async_waiters[wi];
+            let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
+                async_waiters.swap_remove(wi);
                 continue;
             };
             if !conn.has_pending_async() {
+                conn.in_async_list = false;
+                async_waiters.swap_remove(wi);
                 continue;
             }
             if conn.poll_async() {
@@ -175,10 +184,19 @@ pub async fn run(
                 let closed = matches!(conn.drive(false, true), DriveResult::Closed);
                 if closed {
                     remove_conn(&mut poll, &mut conns, &mut free, idx);
-                } else if let Some(conn) = conns[idx].as_mut() {
+                    async_waiters.swap_remove(wi);
+                    continue;
+                }
+                if let Some(conn) = conns[idx].as_mut() {
                     reregister(&mut poll, conn);
+                    if !conn.has_pending_async() {
+                        conn.in_async_list = false;
+                        async_waiters.swap_remove(wi);
+                        continue;
+                    }
                 }
             }
+            wi += 1;
         }
 
         // 6) Drain complete?
@@ -202,10 +220,8 @@ pub async fn run(
             }
         }
 
-        let pending_async = conns.iter().flatten().any(|c| c.has_pending_async());
-
         // 7) Yield only when multi-gather / oneshot tasks need the LocalSet.
-        if pending_async {
+        if !async_waiters.is_empty() {
             tokio::task::yield_now().await;
             continue;
         }
@@ -247,8 +263,11 @@ pub async fn run(
                         };
                         if closed {
                             remove_conn(&mut poll, &mut conns, &mut free, idx);
-                        } else if let Some(conn) = conns[idx].as_mut() {
-                            reregister(&mut poll, conn);
+                        } else {
+                            track_async_waiter(&mut conns, &mut async_waiters, idx);
+                            if let Some(conn) = conns[idx].as_mut() {
+                                reregister(&mut poll, conn);
+                            }
                         }
                     }
                 }
@@ -330,6 +349,20 @@ fn accept_ready(
                 break;
             }
         }
+    }
+}
+
+fn track_async_waiter(
+    conns: &mut [Option<Connection>],
+    waiters: &mut Vec<usize>,
+    idx: usize,
+) {
+    let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
+        return;
+    };
+    if conn.has_pending_async() && !conn.in_async_list {
+        conn.in_async_list = true;
+        waiters.push(idx);
     }
 }
 
