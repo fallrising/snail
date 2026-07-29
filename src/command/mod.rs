@@ -195,14 +195,42 @@ pub struct CommandSpec {
 }
 
 pub fn lookup_spec(cmd: &str) -> Option<&'static CommandSpec> {
-    COMMAND_TABLE.iter().find(|s| s.name == cmd)
+    COMMAND_MAP.get(cmd).copied()
 }
+
+static COMMAND_MAP: std::sync::LazyLock<ahash::HashMap<&'static str, &'static CommandSpec>> =
+    std::sync::LazyLock::new(|| {
+        let mut m = ahash::HashMap::default();
+        for spec in COMMAND_TABLE {
+            m.insert(spec.name, spec);
+        }
+        m
+    });
 
 pub fn parse(frame: &Frame) -> Result<Command, CommandError> {
     if frame.args.is_empty() {
         return Err(CommandError::WrongArity("empty"));
     }
-    let name = ascii_upper(&frame.args[0]);
+    // Hot path: C10K GET/SET/PING without allocating the command-name String.
+    let raw = &frame.args[0];
+    if frame.args.len() == 2 && eq_ignore_case(raw, b"GET") {
+        return Ok(Command::Get(frame.args[1].clone()));
+    }
+    if frame.args.len() == 3 && eq_ignore_case(raw, b"SET") {
+        return Ok(Command::Set(
+            frame.args[1].clone(),
+            frame.args[2].clone(),
+            Default::default(),
+        ));
+    }
+    if frame.args.len() == 1 && eq_ignore_case(raw, b"PING") {
+        return Ok(Command::Ping(None));
+    }
+    if frame.args.len() == 2 && eq_ignore_case(raw, b"PING") {
+        return Ok(Command::Ping(Some(frame.args[1].clone())));
+    }
+
+    let name = ascii_upper(raw);
     let spec = lookup_spec(&name).ok_or_else(|| CommandError::UnknownCommand(name.clone()))?;
     let argc = frame.args.len();
     let min = spec.min_arity.max(0) as usize;
@@ -533,33 +561,21 @@ pub fn command_keys(cmd: &Command) -> Vec<Bytes> {
     match cmd {
         Command::Del(ks) | Command::Exists(ks) | Command::MGet(ks) => ks.clone(),
         Command::MSet(pairs) | Command::MSetNx(pairs) => pairs.iter().map(|(k, _)| k.clone()).collect(),
-        Command::LPush(k, _)
-        | Command::RPush(k, _)
-        | Command::HGetAll(k)
-        | Command::HSet(k, _)
-        | Command::HGet(k, _)
-        | Command::HScan { key: k, .. }
-        | Command::SScan { key: k, .. }
-        | Command::SAdd(k, _) => {
-            vec![k.clone()]
-        }
         Command::Rename(a, b) | Command::RenameNx(a, b) => vec![a.clone(), b.clone()],
         Command::SInter(ks) | Command::SUnion(ks) | Command::SDiff(ks) => ks.clone(),
-        Command::SInterStore(dst, ks) => {
+        Command::SInterStore(dst, ks)
+        | Command::SUnionStore(dst, ks)
+        | Command::SDiffStore(dst, ks) => {
             let mut v = vec![dst.clone()];
             v.extend(ks.iter().cloned());
             v
         }
-        _ => extract_first_key(cmd),
+        _ => primary_key(cmd).into_iter().cloned().collect(),
     }
 }
 
-fn extract_first_key(cmd: &Command) -> Vec<Bytes> {
-    macro_rules! one {
-        ($k:expr) => {
-            return vec![$k.clone()]
-        };
-    }
+/// Borrow the primary routing key without allocating (single-key commands).
+pub fn primary_key(cmd: &Command) -> Option<&Bytes> {
     match cmd {
         Command::Get(k)
         | Command::Set(k, _, _)
@@ -611,6 +627,7 @@ fn extract_first_key(cmd: &Command) -> Vec<Bytes> {
         | Command::HVals(k)
         | Command::HIncrBy(k, _, _)
         | Command::HIncrByFloat(k, _, _)
+        | Command::HScan { key: k, .. }
         | Command::SAdd(k, _)
         | Command::SRem(k, _)
         | Command::SCard(k)
@@ -619,6 +636,7 @@ fn extract_first_key(cmd: &Command) -> Vec<Bytes> {
         | Command::SMembers(k)
         | Command::SPop(k, _)
         | Command::SRandMember(k, _)
+        | Command::SScan { key: k, .. }
         | Command::ZAdd(k, _, _)
         | Command::ZRem(k, _)
         | Command::ZScore(k, _)
@@ -631,12 +649,12 @@ fn extract_first_key(cmd: &Command) -> Vec<Bytes> {
         | Command::ZRevRank(k, _)
         | Command::ZCount(k, _, _)
         | Command::ZPopMin(k, _)
-        | Command::ZPopMax(k, _) => one!(k),
-        Command::ZRangeByScore(k, _, _, _, _)
-        | Command::ZRevRangeByScore(k, _, _, _, _) => one!(k),
-        Command::HScan { key: k, .. } | Command::SScan { key: k, .. } => one!(k),
-        Command::Rename(src, _) | Command::RenameNx(src, _) => one!(src),
-        _ => vec![],
+        | Command::ZPopMax(k, _)
+        | Command::ZRangeByScore(k, _, _, _, _)
+        | Command::ZRevRangeByScore(k, _, _, _, _)
+        | Command::Rename(k, _)
+        | Command::RenameNx(k, _) => Some(k),
+        _ => None,
     }
 }
 

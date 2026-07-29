@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 
 use crate::command::apply;
 use crate::command::set::{set_op, SetOp};
-use crate::command::{command_keys, route_class, Command, RouteClass};
+use crate::command::{primary_key, route_class, Command, RouteClass};
 use crate::config::Config;
 use crate::error::CommandError;
 use crate::protocol::frame::Reply;
@@ -77,11 +77,8 @@ impl Dispatcher {
             }
         }
 
-        let key = command_keys(&cmd)
-            .into_iter()
-            .next()
-            .expect("key command");
-        let shard_id = self.shard_map.shard_of(&key);
+        let key = primary_key(&cmd).expect("key command");
+        let shard_id = self.shard_map.shard_of(key);
         if self.shard_map.owner_of(shard_id) == self.worker_id {
             DispatchResult::Immediate(self.apply_local(shard_id, cmd))
         } else {

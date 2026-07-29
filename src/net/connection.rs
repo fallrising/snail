@@ -61,6 +61,7 @@ pub struct Connection {
     state: ConnState,
     pool: Rc<BufferPool>,
     ctx: ConnContext,
+    dispatcher: Dispatcher,
     reject_only: bool,
     counted: bool,
     /// Last registered mio interest (for reregister elision).
@@ -76,6 +77,15 @@ impl Connection {
         token: Token,
     ) -> Self {
         let _ = stream.set_nodelay(true);
+        let dispatcher = Dispatcher {
+            worker_id: ctx.worker_id,
+            shard_map: ctx.shard_map.clone(),
+            shard_client: ctx.shard_client.clone(),
+            local_shards: ctx.local_shards.clone(),
+            config: ctx.config.clone(),
+            info: ctx.info.clone(),
+            now_ms: 0,
+        };
         Self {
             stream,
             read_buf: pool.get(ctx.config.read_buf_init),
@@ -86,6 +96,7 @@ impl Connection {
             state: ConnState::Normal,
             pool,
             ctx,
+            dispatcher,
             reject_only: false,
             counted: true,
             registered: Interest::READABLE,
@@ -103,6 +114,15 @@ impl Connection {
         let msg = b"-ERR max number of clients reached\r\n";
         let mut out_buf = BytesMut::with_capacity(64);
         out_buf.extend_from_slice(msg);
+        let dispatcher = Dispatcher {
+            worker_id: ctx.worker_id,
+            shard_map: ctx.shard_map.clone(),
+            shard_client: ctx.shard_client.clone(),
+            local_shards: ctx.local_shards.clone(),
+            config: ctx.config.clone(),
+            info: ctx.info.clone(),
+            now_ms: 0,
+        };
         Self {
             stream,
             read_buf: BytesMut::new(),
@@ -113,6 +133,7 @@ impl Connection {
             state: ConnState::CloseAfterFlush,
             pool,
             ctx,
+            dispatcher,
             reject_only: true,
             counted: false,
             registered: Interest::WRITABLE,
@@ -357,17 +378,8 @@ impl Connection {
                         return Ok(());
                     }
 
-                    let dispatcher = Dispatcher {
-                        worker_id: self.ctx.worker_id,
-                        shard_map: self.ctx.shard_map.clone(),
-                        shard_client: self.ctx.shard_client.clone(),
-                        local_shards: self.ctx.local_shards.clone(),
-                        config: self.ctx.config.clone(),
-                        info: self.ctx.info.clone(),
-                        now_ms: *self.ctx.now_ms.borrow(),
-                    };
-
-                    match dispatcher.dispatch(cmd) {
+                    self.dispatcher.now_ms = *self.ctx.now_ms.borrow();
+                    match self.dispatcher.dispatch(cmd) {
                         crate::command::dispatcher::DispatchResult::Immediate(reply) => {
                             // Fast path: no in-flight async replies → encode directly.
                             if self.pending.is_empty() {

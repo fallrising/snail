@@ -106,24 +106,23 @@ rudis \
 ## Benchmarking
 
 ```bash
-# 構建壓測工具
-cargo build --release --bin rudis --bin rudis-bench
-
-# C10K 驗收（需 ulimit -n 65536）
-ulimit -n 65536
+# C10K 延遲驗收
 ./scripts/bench-c10k.sh all
 
-# 簡易壓測（有 redis-benchmark 時優先使用，否則回退 rudis-bench）
-./scripts/bench.sh
+# C100K 連線持有（需 ulimit -n 足夠大，建議 ≥ 2×CLIENTS）
+CLIENTS=100000 HOLD_SECS=30 ./scripts/bench-c100k.sh all
 
-# 高連線數 OS 調優（需 root）
-sudo ./scripts/sysctl-tuning.sh
+# OS 調優（需 root；含還原）
+sudo ./scripts/sysctl-tuning.sh apply
+sudo ./scripts/sysctl-tuning.sh restore
 ```
 
 C10K 驗收口徑：10K 全活躍、GET/SET 8:2、無 pipeline、p99 < 5ms、零錯誤。
 
-**基線 / 現況**（mio 反應器後，6 workers）：10K 連線、1M 請求、零錯誤、~120–140K req/s，p99 ≈ 150 ms。  
-64 連線時 p99 ≈ 6 ms。詳見 [docs/STATUS.md](docs/STATUS.md)。
+**現況**（mio 反應器 + 熱路徑優化後）：
+- 64 連線延遲：**p99 ≈ 4.3 ms PASS**
+- 10K 連線 hold：PASS（需足夠 `ulimit -n`）
+- 10K 全活躍延遲：p99 ≈ 150 ms（受吞吐限制，見 STATUS）
 
 ## Development
 
@@ -148,8 +147,8 @@ snail/
 
 ### Next steps
 
-1. 拉高單機吞吐（C10K p99&lt;5ms 約需 ≥2M req/s）
-2. C100K 連線持有、M3 io_uring / C1M
+1. 拉高吞吐以滿足 10K 全活躍 p99&lt;5ms
+2. 高 FD 環境跑滿 C100K；M3 io_uring / C1M
 
 ## License
 

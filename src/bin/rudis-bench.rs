@@ -1,4 +1,8 @@
-//! C10K benchmark client — async tokio, GET/SET 8:2, no pipeline.
+//! Benchmark / connection-hold client for rudis.
+//!
+//! Modes:
+//!   (default) latency: GET/SET 8:2, no pipeline — C10K acceptance
+//!   --hold: open N connections, keep alive with PING, report hold success
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,6 +13,12 @@ use rand::{Rng, SeedableRng};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Latency,
+    Hold,
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -21,6 +31,9 @@ struct Config {
     key_count: usize,
     seed_keys: bool,
     connect_batch: usize,
+    mode: Mode,
+    hold_secs: u64,
+    ping_interval_ms: u64,
 }
 
 impl Config {
@@ -35,6 +48,9 @@ impl Config {
             key_count: 10_000,
             seed_keys: true,
             connect_batch: 500,
+            mode: Mode::Latency,
+            hold_secs: 30,
+            ping_interval_ms: 1000,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -60,8 +76,24 @@ impl Config {
                 "--connect-batch" => {
                     cfg.connect_batch = args.next().expect("batch").parse().expect("batch")
                 }
+                "--hold" => {
+                    cfg.mode = Mode::Hold;
+                    cfg.seed_keys = false;
+                }
+                "--hold-secs" => {
+                    cfg.hold_secs = args.next().expect("hold-secs").parse().expect("secs")
+                }
+                "--ping-interval-ms" => {
+                    cfg.ping_interval_ms = args
+                        .next()
+                        .expect("ping-interval")
+                        .parse()
+                        .expect("ms")
+                }
                 "--help" | "-h" => {
-                    eprintln!("rudis-bench: see scripts/bench-c10k.sh");
+                    eprintln!(
+                        "rudis-bench [--hold] -c N -n M --port P\n  --hold: C100K connection hold + PING"
+                    );
                     std::process::exit(0);
                 }
                 other => {
@@ -74,11 +106,27 @@ impl Config {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() {
+fn main() {
     let cfg = Config::from_args();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().max(4))
+        .unwrap_or(8);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async move {
+        match cfg.mode {
+            Mode::Latency => run_latency(cfg).await,
+            Mode::Hold => run_hold(cfg).await,
+        }
+    });
+}
+
+async fn run_latency(cfg: Config) {
     eprintln!(
-        "rudis-bench: {}:{} clients={} measure={} warmup={} get_ratio={}",
+        "rudis-bench latency: {}:{} clients={} measure={} warmup={} get_ratio={}",
         cfg.host,
         cfg.port,
         cfg.clients,
@@ -127,10 +175,130 @@ async fn main() {
     let ok = lats.len();
     let err = errors.load(Ordering::Relaxed);
 
-    print_report(&cfg, total, ok, err, elapsed.as_secs_f64(), &lats);
+    print_latency_report(&cfg, total, ok, err, elapsed.as_secs_f64(), &lats);
 }
 
-fn print_report(cfg: &Config, total: usize, ok: usize, err: usize, secs: f64, lats: &[u64]) {
+async fn run_hold(cfg: Config) {
+    eprintln!(
+        "rudis-bench hold: {}:{} clients={} hold={}s ping_every={}ms",
+        cfg.host, cfg.port, cfg.clients, cfg.hold_secs, cfg.ping_interval_ms
+    );
+
+    let connected = Arc::new(AtomicUsize::new(0));
+    let connect_fail = Arc::new(AtomicUsize::new(0));
+    let ping_ok = Arc::new(AtomicUsize::new(0));
+    let ping_err = Arc::new(AtomicUsize::new(0));
+    let latencies = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+    let connect_barrier = Arc::new(Barrier::new(cfg.clients + 1));
+    let deadline = Instant::now() + Duration::from_secs(cfg.hold_secs);
+
+    let mut handles = Vec::new();
+    for batch_start in (0..cfg.clients).step_by(cfg.connect_batch) {
+        let batch_end = (batch_start + cfg.connect_batch).min(cfg.clients);
+        for _id in batch_start..batch_end {
+            let cfg = cfg.clone();
+            let connected = connected.clone();
+            let connect_fail = connect_fail.clone();
+            let ping_ok = ping_ok.clone();
+            let ping_err = ping_err.clone();
+            let latencies = latencies.clone();
+            let connect_barrier = connect_barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let addr = format!("{}:{}", cfg.host, cfg.port);
+                let mut stream = match connect_with_retry(&addr, 5).await {
+                    Some(s) => {
+                        connected.fetch_add(1, Ordering::Relaxed);
+                        s
+                    }
+                    None => {
+                        connect_fail.fetch_add(1, Ordering::Relaxed);
+                        connect_barrier.wait().await;
+                        return;
+                    }
+                };
+                connect_barrier.wait().await;
+
+                let ping = resp_cmd(&["PING"]);
+                let mut local = Vec::new();
+                while Instant::now() < deadline {
+                    match exchange(&mut stream, &ping).await {
+                        Ok(us) => {
+                            ping_ok.fetch_add(1, Ordering::Relaxed);
+                            local.push(us);
+                        }
+                        Err(_) => {
+                            ping_err.fetch_add(1, Ordering::Relaxed);
+                            if let Some(s) = connect_with_retry(&addr, 2).await {
+                                stream = s;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(cfg.ping_interval_ms.max(1))).await;
+                }
+                latencies.lock().await.extend(local);
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    connect_barrier.wait().await;
+    let live = connected.load(Ordering::Relaxed);
+    eprintln!(
+        "hold: connected={live} failed={} — holding {}s...",
+        connect_fail.load(Ordering::Relaxed),
+        cfg.hold_secs
+    );
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let mut lats = latencies.lock().await.clone();
+    lats.sort_unstable();
+    let ok = ping_ok.load(Ordering::Relaxed);
+    let err = ping_err.load(Ordering::Relaxed);
+    let fail = connect_fail.load(Ordering::Relaxed);
+
+    println!();
+    println!("====== rudis connection hold ======");
+    println!("target clients:  {}", cfg.clients);
+    println!("connected:       {live}");
+    println!("connect failed:  {fail}");
+    println!("hold duration:   {}s", cfg.hold_secs);
+    println!("ping ok:         {ok}");
+    println!("ping errors:     {err}");
+    if !lats.is_empty() {
+        println!(
+            "ping p50/p99:    {} / {} µs",
+            percentile(&lats, 50.0),
+            percentile(&lats, 99.0)
+        );
+    }
+
+    // Pass if ≥99% of target connections established and ping errors < 1% of pings.
+    let conn_ok = live * 100 >= cfg.clients * 99;
+    let ping_total = ok + err;
+    let ping_ok_ratio = if ping_total == 0 {
+        false
+    } else {
+        err * 100 < ping_total
+    };
+    if conn_ok && ping_ok_ratio && fail == 0 {
+        println!();
+        println!("RESULT: PASS (connected={live}/{}, ping_err={err})", cfg.clients);
+    } else {
+        println!();
+        println!(
+            "RESULT: FAIL (connected={live}/{}, connect_fail={fail}, ping_err={err})",
+            cfg.clients
+        );
+        std::process::exit(1);
+    }
+}
+
+fn print_latency_report(cfg: &Config, total: usize, ok: usize, err: usize, secs: f64, lats: &[u64]) {
     println!();
     println!("====== rudis C10K benchmark ======");
     println!("connections:     {}", cfg.clients);
@@ -140,7 +308,7 @@ fn print_report(cfg: &Config, total: usize, ok: usize, err: usize, secs: f64, la
     println!("successful:      {ok}");
     println!("errors:          {err}");
     println!("duration:        {secs:.2}s");
-    println!("throughput:      {:.0} req/s", ok as f64 / secs);
+    println!("throughput:      {:.0} req/s", ok as f64 / secs.max(1e-9));
     println!("get/set ratio:   {:.0}% GET", cfg.get_ratio * 100.0);
 
     if lats.is_empty() {
@@ -203,7 +371,16 @@ async fn run_client(
     }
 
     for _ in 0..cfg.requests_per_client {
-        if !one_request(&mut stream, &addr, &mut rng, &cfg, &errors, Some(&mut local)).await {
+        if !one_request(
+            &mut stream,
+            &addr,
+            &mut rng,
+            &cfg,
+            &errors,
+            Some(&mut local),
+        )
+        .await
+        {
             return;
         }
     }
@@ -219,11 +396,19 @@ async fn one_request(
     errors: &Arc<AtomicUsize>,
     record: Option<&mut Vec<u64>>,
 ) -> bool {
-    let key = format!("bk{}", rng.gen_range(0..cfg.key_count));
+    let kid = rng.gen_range(0..cfg.key_count);
+    // Avoid heap format for the common GET path where possible via stack buffer.
+    let mut key_buf = [0u8; 32];
+    let key = {
+        let s = format!("bk{kid}");
+        let n = s.len().min(key_buf.len());
+        key_buf[..n].copy_from_slice(s.as_bytes());
+        std::str::from_utf8(&key_buf[..n]).unwrap()
+    };
     let cmd = if rng.gen::<f64>() < cfg.get_ratio {
-        resp_cmd(&["GET", &key])
+        resp_cmd(&["GET", key])
     } else {
-        resp_cmd(&["SET", &key, "v"])
+        resp_cmd(&["SET", key, "v"])
     };
 
     match exchange(stream, &cmd).await {
