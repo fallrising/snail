@@ -2,6 +2,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use mio::net::TcpListener;
 
 use crate::net::reactor;
+use crate::net::uring_reactor;
 use crate::runtime::router::ShardRequest;
 use crate::runtime::worker::WorkerContext;
 use tokio::sync::{broadcast, mpsc};
@@ -12,6 +13,21 @@ pub async fn accept_loop(
     shard_range: std::ops::Range<usize>,
     shutdown_rx: broadcast::Receiver<()>,
 ) {
+    if reactor::io_uring_enabled() {
+        match uring_reactor::probe() {
+            Ok(()) => {
+                if let Err(e) =
+                    uring_reactor::run(ctx, request_rx, shard_range, shutdown_rx).await
+                {
+                    tracing::error!(error = %e, "io_uring completion reactor error");
+                }
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "io_uring unavailable; falling back to mio");
+            }
+        }
+    }
     reactor::run(ctx, request_rx, shard_range, shutdown_rx).await;
 }
 

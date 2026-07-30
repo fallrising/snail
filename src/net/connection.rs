@@ -75,6 +75,10 @@ pub struct Connection {
     async_wait: bool,
     /// In reactor's async_waiters list (avoid duplicate entries).
     pub in_async_list: bool,
+    /// Completion-mode: Recv SQE outstanding (buffer must stay pinned).
+    pub recv_inflight: bool,
+    /// Completion-mode: Writev SQE outstanding (out_buf must stay stable).
+    pub send_inflight: bool,
 }
 
 impl Connection {
@@ -110,6 +114,8 @@ impl Connection {
             token,
             async_wait: false,
             in_async_list: false,
+            recv_inflight: false,
+            send_inflight: false,
         }
     }
 
@@ -148,6 +154,8 @@ impl Connection {
             token,
             async_wait: false,
             in_async_list: false,
+            recv_inflight: false,
+            send_inflight: false,
         }
     }
 
@@ -256,8 +264,28 @@ impl Connection {
     }
 
     #[inline]
+    pub fn is_reject_only(&self) -> bool {
+        self.reject_only
+    }
+
+    #[inline]
     pub fn has_pending_out(&self) -> bool {
         !self.out_buf.is_empty()
+    }
+
+    /// After harvest/encode in completion mode: true if a Send should be queued.
+    #[inline]
+    pub fn wants_uring_send(&self) -> bool {
+        self.has_pending_out() && !self.send_inflight
+    }
+
+    /// After I/O in completion mode: true if a Recv should be queued.
+    #[inline]
+    pub fn wants_uring_recv(&self) -> bool {
+        !self.reject_only
+            && !self.recv_inflight
+            && !self.send_inflight
+            && self.can_read()
     }
 
     #[inline]
