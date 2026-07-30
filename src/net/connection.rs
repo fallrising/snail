@@ -280,12 +280,10 @@ impl Connection {
     }
 
     /// After I/O in completion mode: true if a Recv should be queued.
+    /// May run concurrent with an in-flight Send (out_buf freezes segs first).
     #[inline]
     pub fn wants_uring_recv(&self) -> bool {
-        !self.reject_only
-            && !self.recv_inflight
-            && !self.send_inflight
-            && self.can_read()
+        !self.reject_only && !self.recv_inflight && self.can_read()
     }
 
     #[inline]
@@ -297,7 +295,9 @@ impl Connection {
         self.try_flush()
     }
 
-    pub fn fill_send_iovecs(&self, iov: &mut [libc::iovec]) -> u32 {
+    /// Freeze contiguous tail into stable `Bytes` segs, then fill iovecs.
+    pub fn fill_send_iovecs(&mut self, iov: &mut [libc::iovec]) -> u32 {
+        self.out_buf.freeze_tail();
         self.out_buf.fill_iovecs(iov) as u32
     }
 
@@ -521,16 +521,18 @@ impl Connection {
     }
 
     fn process_input(&mut self, shards: &mut [Shard]) -> Result<(), ProtocolError> {
+        let now = *self.ctx.now_ms.borrow();
+        let single_shard = self.ctx.shard_map.num_shards() == 1;
         loop {
             // Fast path: plain GET/SET without building Frame/Command.
             if self.pending.is_empty() && self.parser.is_idle() {
                 match try_parse_hot_get_set(&mut self.read_buf) {
                     HotParse::Get(key) => {
-                        self.apply_hot_get(key, shards);
+                        self.apply_hot_get(key, shards, now, single_shard);
                         continue;
                     }
                     HotParse::Set(key, val) => {
-                        self.apply_hot_set(key, val, shards);
+                        self.apply_hot_set(key, val, shards, now, single_shard);
                         continue;
                     }
                     HotParse::None => {}
@@ -554,7 +556,7 @@ impl Connection {
                         return Ok(());
                     }
 
-                    if let Some(reply) = self.try_local_fast(cmd, shards) {
+                    if let Some(reply) = self.try_local_fast(cmd, shards, now, single_shard) {
                         self.enqueue_immediate(reply);
                     }
                 }
@@ -565,8 +567,18 @@ impl Connection {
     }
 
     #[inline]
-    fn apply_hot_get(&mut self, key: Bytes, shards: &mut [Shard]) {
-        let now = *self.ctx.now_ms.borrow();
+    fn apply_hot_get(
+        &mut self,
+        key: Bytes,
+        shards: &mut [Shard],
+        now: u64,
+        single_shard: bool,
+    ) {
+        if single_shard {
+            let reply = string::apply_get(&mut shards[0], &key, now);
+            self.encode_hot(&reply);
+            return;
+        }
         let shard_id = self.ctx.shard_map.shard_of(&key);
         if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
             self.dispatcher.now_ms = now;
@@ -591,9 +603,27 @@ impl Connection {
     }
 
     #[inline]
-    fn apply_hot_set(&mut self, key: Bytes, val: Bytes, shards: &mut [Shard]) {
-        let now = *self.ctx.now_ms.borrow();
+    fn apply_hot_set(
+        &mut self,
+        key: Bytes,
+        val: Bytes,
+        shards: &mut [Shard],
+        now: u64,
+        single_shard: bool,
+    ) {
         let opts = SetOptions::default();
+        if single_shard {
+            let reply = string::apply_set(
+                &mut shards[0],
+                key,
+                val,
+                opts,
+                now,
+                &self.ctx.config,
+            );
+            self.encode_hot(&reply);
+            return;
+        }
         let shard_id = self.ctx.shard_map.shard_of(&key);
         if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
             self.dispatcher.now_ms = now;
@@ -624,8 +654,13 @@ impl Connection {
         self.encode_hot(&reply);
     }
 
-    fn try_local_fast(&mut self, cmd: Command, shards: &mut [Shard]) -> Option<Reply> {
-        let now = *self.ctx.now_ms.borrow();
+    fn try_local_fast(
+        &mut self,
+        cmd: Command,
+        shards: &mut [Shard],
+        now: u64,
+        single_shard: bool,
+    ) -> Option<Reply> {
         match cmd {
             Command::Ping(None) => {
                 if self.pending.is_empty() {
@@ -637,6 +672,14 @@ impl Connection {
             }
             Command::Ping(Some(msg)) => Some(Reply::Bulk(msg)),
             Command::Get(k) => {
+                if single_shard {
+                    let reply = string::apply_get(&mut shards[0], &k, now);
+                    if self.pending.is_empty() {
+                        self.encode_hot(&reply);
+                        return None;
+                    }
+                    return Some(reply);
+                }
                 let shard_id = self.ctx.shard_map.shard_of(&k);
                 if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
                     self.dispatcher.now_ms = now;
@@ -663,6 +706,21 @@ impl Connection {
                 }
             }
             Command::Set(k, v, opts) if opts == SetOptions::default() => {
+                if single_shard {
+                    let reply = string::apply_set(
+                        &mut shards[0],
+                        k,
+                        v,
+                        opts,
+                        now,
+                        &self.ctx.config,
+                    );
+                    if self.pending.is_empty() {
+                        self.encode_hot(&reply);
+                        return None;
+                    }
+                    return Some(reply);
+                }
                 let shard_id = self.ctx.shard_map.shard_of(&k);
                 if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
                     self.dispatcher.now_ms = now;

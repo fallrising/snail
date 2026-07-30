@@ -94,19 +94,13 @@ struct CompletionRing {
 
 impl CompletionRing {
     fn try_new() -> io::Result<Self> {
-        let ring = match IoUring::builder()
-            .setup_cqsize(RING_ENTRIES * 2)
-            .setup_clamp()
-            .setup_single_issuer()
-            .setup_coop_taskrun()
-            .build(RING_ENTRIES)
-        {
-            Ok(r) => r,
-            Err(_) => IoUring::builder()
-                .setup_cqsize(RING_ENTRIES * 2)
-                .setup_clamp()
-                .build(RING_ENTRIES)?,
-        };
+        // Prefer single-issuer + coop taskrun; fall back if the kernel rejects flags.
+        // SQPOLL is opt-in via RUDIS_IO_URING_SQPOLL=1 (needs privileges on some hosts).
+        let want_sqpoll = matches!(
+            std::env::var("RUDIS_IO_URING_SQPOLL").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+        );
+        let ring = build_ring(RING_ENTRIES, want_sqpoll)?;
         Ok(Self {
             ring,
             iov_by_conn: Vec::new(),
@@ -277,6 +271,12 @@ impl CompletionRing {
         }
     }
 
+    /// True if the completion queue already has entries (no wait).
+    fn cq_ready(&mut self) -> bool {
+        let cq = self.ring.completion();
+        !cq.is_empty()
+    }
+
     fn drain_cqes(
         &mut self,
         conns: &mut [Option<Connection>],
@@ -334,7 +334,8 @@ impl CompletionRing {
                     track_async(conn, async_waiters, idx);
                     if conn.wants_uring_send() {
                         requeue_send.push(idx);
-                    } else if conn.wants_uring_recv() {
+                    }
+                    if conn.wants_uring_recv() {
                         requeue_recv.push(idx);
                     } else if conn.should_close_now() {
                         to_close.push(idx);
@@ -357,7 +358,8 @@ impl CompletionRing {
                     }
                     if conn.wants_uring_send() {
                         requeue_send.push(idx);
-                    } else if conn.wants_uring_recv() {
+                    }
+                    if conn.wants_uring_recv() {
                         requeue_recv.push(idx);
                     } else if conn.should_close_now() {
                         to_close.push(idx);
@@ -372,6 +374,32 @@ impl CompletionRing {
         for idx in requeue_recv {
             self.queue_recv(idx);
         }
+    }
+}
+
+fn build_ring(entries: u32, want_sqpoll: bool) -> io::Result<IoUring> {
+    if want_sqpoll {
+        if let Ok(r) = IoUring::builder()
+            .setup_cqsize(entries * 2)
+            .setup_clamp()
+            .setup_sqpoll(50)
+            .build(entries)
+        {
+            return Ok(r);
+        }
+    }
+    match IoUring::builder()
+        .setup_cqsize(entries * 2)
+        .setup_clamp()
+        .setup_single_issuer()
+        .setup_coop_taskrun()
+        .build(entries)
+    {
+        Ok(r) => Ok(r),
+        Err(_) => IoUring::builder()
+            .setup_cqsize(entries * 2)
+            .setup_clamp()
+            .build(entries),
     }
 }
 
@@ -526,59 +554,75 @@ pub async fn run(
             ring.flush_submissions(&mut conns, listener_fd, wake_fd, accepting);
         }
 
-        if ring.has_waitable() {
+        // Burst: wait once, then keep draining/submitting while the CQ stays hot.
+        if ring.has_waitable() && !ring.cq_ready() {
             let _ = ring.wait_cqe();
-        } else if !async_waiters.is_empty() {
-            tokio::task::yield_now().await;
-        } else {
-            // Truly idle (shutdown drain with nothing left): short sleep.
-            tokio::task::yield_now().await;
+        } else if !ring.has_waitable() {
+            if !async_waiters.is_empty() {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::task::yield_now().await;
+            }
         }
 
-        let mut woke = false;
-        new_fds.clear();
-        let mut to_close = Vec::new();
-        {
-            let mut guard = ctx.local_shards.borrow_mut();
-            ring.drain_cqes(
-                &mut conns,
-                guard.as_mut_slice(),
-                &mut to_close,
-                &mut async_waiters,
-                &mut new_fds,
-                &mut woke,
-                accepting,
-            );
-        }
+        for _burst in 0..32 {
+            let mut woke = false;
+            new_fds.clear();
+            let mut to_close = Vec::new();
+            {
+                let mut guard = ctx.local_shards.borrow_mut();
+                ring.drain_cqes(
+                    &mut conns,
+                    guard.as_mut_slice(),
+                    &mut to_close,
+                    &mut async_waiters,
+                    &mut new_fds,
+                    &mut woke,
+                    accepting,
+                );
+            }
 
-        for fd in new_fds.drain(..) {
-            install_conn(
-                fd,
-                &mut conns,
-                &mut free,
-                &ctx,
-                &conn_ctx,
-                &pool,
-                &mut ring,
-            );
-        }
+            for fd in new_fds.drain(..) {
+                install_conn(
+                    fd,
+                    &mut conns,
+                    &mut free,
+                    &ctx,
+                    &conn_ctx,
+                    &pool,
+                    &mut ring,
+                );
+            }
 
-        if woke {
-            ctx.shard_client.clear_wake(ctx.worker_id);
-            drain_shards(
-                &mut request_rx,
-                &ctx,
-                &shard_range,
-                &mut conns,
-                &mut async_waiters,
-                &mut ring,
-            );
-        }
+            if woke {
+                ctx.shard_client.clear_wake(ctx.worker_id);
+                drain_shards(
+                    &mut request_rx,
+                    &ctx,
+                    &shard_range,
+                    &mut conns,
+                    &mut async_waiters,
+                    &mut ring,
+                );
+            }
 
-        for idx in to_close {
-            remove_conn(&mut conns, &mut free, idx);
+            for idx in to_close {
+                remove_conn(&mut conns, &mut free, idx);
+            }
+            harvest_and_queue(&mut conns, &mut async_waiters, &mut ring);
+            ring.flush_submissions(&mut conns, listener_fd, wake_fd, accepting);
+
+            if !ring.cq_ready()
+                && ring.pending_recv.is_empty()
+                && ring.pending_send.is_empty()
+            {
+                break;
+            }
+            if ring.has_waitable() && !ring.cq_ready() {
+                // More I/O in flight but CQ empty — leave burst; next turn waits.
+                break;
+            }
         }
-        ring.flush_submissions(&mut conns, listener_fd, wake_fd, accepting);
 
         if !accepting {
             let live = conns.iter().filter(|c| c.is_some()).count();

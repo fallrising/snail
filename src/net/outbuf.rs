@@ -98,8 +98,9 @@ impl OutBuf {
         }
     }
 
-    /// Move contiguous tail into `segs` so a zero-copy segment can follow in order.
-    fn freeze_tail(&mut self) {
+    /// Move contiguous tail into `segs` so iovecs stay stable while new data
+    /// is appended to a fresh `buf` (needed for concurrent Recv during Send).
+    pub fn freeze_tail(&mut self) {
         if self.buf_off > 0 {
             let _ = self.buf.split_to(self.buf_off);
             self.buf_off = 0;
