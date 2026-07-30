@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read};
+use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -175,10 +176,17 @@ impl Connection {
 
     /// Drive this connection from a mio readiness event (or opportunistic pass).
     /// `shards` is the worker's local shard slice (already borrowed by the reactor).
-    pub fn drive(&mut self, readable: bool, writable: bool, shards: &mut [Shard]) -> DriveResult {
+    /// When `defer_flush` is set, outbound bytes stay in `out_buf` for io_uring batching.
+    pub fn drive(
+        &mut self,
+        readable: bool,
+        writable: bool,
+        shards: &mut [Shard],
+        defer_flush: bool,
+    ) -> DriveResult {
         let _ = self.try_harvest();
 
-        if writable || !self.out_buf.is_empty() {
+        if !defer_flush && (writable || !self.out_buf.is_empty()) {
             if let Err(e) = self.try_flush() {
                 if e.kind() != ErrorKind::WouldBlock {
                     self.release_buffers();
@@ -198,6 +206,9 @@ impl Connection {
         }
 
         if self.reject_only {
+            if defer_flush && !self.out_buf.is_empty() {
+                return DriveResult::Pending;
+            }
             return if self.out_buf.is_empty() {
                 self.release_buffers();
                 DriveResult::Closed
@@ -219,10 +230,12 @@ impl Connection {
                 }
                 Ok(true) => {
                     let _ = self.try_harvest();
-                    if let Err(e) = self.try_flush() {
-                        if e.kind() != ErrorKind::WouldBlock {
-                            self.release_buffers();
-                            return DriveResult::Closed;
+                    if !defer_flush {
+                        if let Err(e) = self.try_flush() {
+                            if e.kind() != ErrorKind::WouldBlock {
+                                self.release_buffers();
+                                return DriveResult::Closed;
+                            }
                         }
                     }
                 }
@@ -234,6 +247,105 @@ impl Connection {
             return DriveResult::Closed;
         }
 
+        DriveResult::Pending
+    }
+
+    #[inline]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+
+    #[inline]
+    pub fn has_pending_out(&self) -> bool {
+        !self.out_buf.is_empty()
+    }
+
+    #[inline]
+    pub fn should_close_now(&self) -> bool {
+        self.should_close()
+    }
+
+    pub fn flush_sync(&mut self) -> io::Result<()> {
+        self.try_flush()
+    }
+
+    pub fn fill_send_iovecs(&self, iov: &mut [libc::iovec]) -> u32 {
+        self.out_buf.fill_iovecs(iov) as u32
+    }
+
+    /// Prepare spare capacity in the read buffer for an io_uring Recv.
+    pub fn prepare_recv_buf(&mut self) -> Option<(*mut u8, u32)> {
+        if !self.can_read() {
+            return None;
+        }
+        if self.read_buf.capacity() == 0 {
+            self.read_buf = self.pool.get(self.ctx.config.read_buf_init);
+        }
+        if self.read_buf.capacity() - self.read_buf.len() < 2048 {
+            self.read_buf.reserve(16 * 1024);
+        }
+        let len = self.read_buf.len();
+        let spare = self.read_buf.capacity() - len;
+        if spare == 0 {
+            return None;
+        }
+        let ptr = unsafe { self.read_buf.as_mut_ptr().add(len) };
+        Some((ptr, spare as u32))
+    }
+
+    pub fn complete_recv(&mut self, result: i32, shards: &mut [Shard]) -> DriveResult {
+        if result == 0 {
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
+        if result < 0 {
+            let err = io::Error::from_raw_os_error(-result);
+            if err.kind() == ErrorKind::WouldBlock {
+                return DriveResult::Pending;
+            }
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
+        let n = result as usize;
+        let len = self.read_buf.len();
+        unsafe {
+            self.read_buf.set_len(len + n);
+        }
+        if let Err(e) = self.process_input(shards) {
+            self.enqueue_err(&protocol_err_reply(&e));
+            self.state = ConnState::CloseAfterFlush;
+        }
+        let _ = self.try_harvest();
+        self.maybe_return_read_buf();
+        if self.out_buf.pending() > self.ctx.config.out_buf_hard {
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
+        if self.should_close() && self.out_buf.is_empty() {
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
+        DriveResult::Pending
+    }
+
+    pub fn complete_send(&mut self, result: i32) -> DriveResult {
+        if result == 0 {
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
+        if result < 0 {
+            let err = io::Error::from_raw_os_error(-result);
+            if err.kind() == ErrorKind::WouldBlock {
+                return DriveResult::Pending;
+            }
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
+        self.out_buf.advance_bytes(result as usize);
+        if self.should_close() && self.out_buf.is_empty() && self.pending.is_empty() {
+            self.release_buffers();
+            return DriveResult::Closed;
+        }
         DriveResult::Pending
     }
 

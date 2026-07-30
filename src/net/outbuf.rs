@@ -174,6 +174,53 @@ impl OutBuf {
             }
         }
     }
+
+    /// Public advance after a partial uring send.
+    pub fn advance_bytes(&mut self, n: usize) {
+        if n > 0 {
+            self.advance(n);
+        }
+        if self.pending == 0 {
+            self.maybe_shrink();
+        }
+    }
+
+    /// Fill libc iovecs for writev (max `out.len()`). Returns iov count.
+    pub fn fill_iovecs(&self, out: &mut [libc::iovec]) -> usize {
+        let mut n = 0usize;
+        for (i, seg) in self.segs.iter().enumerate() {
+            if n >= out.len() {
+                return n;
+            }
+            let off = if i == 0 { self.seg_off } else { 0 };
+            if off < seg.len() {
+                let slice = &seg[off..];
+                out[n] = libc::iovec {
+                    iov_base: slice.as_ptr() as *mut _,
+                    iov_len: slice.len(),
+                };
+                n += 1;
+            }
+        }
+        if n < out.len() && self.buf_off < self.buf.len() {
+            let slice = &self.buf[self.buf_off..];
+            out[n] = libc::iovec {
+                iov_base: slice.as_ptr() as *mut _,
+                iov_len: slice.len(),
+            };
+            n += 1;
+        }
+        n
+    }
+
+    /// Prefer a single contiguous slice when possible (fast Send path).
+    pub fn contiguous_unsent(&self) -> Option<&[u8]> {
+        if self.segs.is_empty() && self.buf_off < self.buf.len() {
+            Some(&self.buf[self.buf_off..])
+        } else {
+            None
+        }
+    }
 }
 
 struct UtoaBuf {

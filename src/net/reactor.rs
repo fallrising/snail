@@ -12,6 +12,7 @@ use tracing::info;
 use crate::command::apply;
 use crate::net::buffer::BufferPool;
 use crate::net::connection::{ConnContext, Connection, DriveResult};
+use crate::net::uring_batch::UringBatch;
 use crate::runtime::router::ShardRequest;
 use crate::runtime::worker::{current_ms, WorkerContext};
 use crate::storage::shard::Shard;
@@ -34,6 +35,21 @@ pub async fn run(
 
     let mut poll = Poll::new().expect("mio poll");
     let mut events = Events::with_capacity(4096);
+    let mut uring = if env_flag_true("RUDIS_IO_URING") {
+        match UringBatch::try_new(4096) {
+            Ok(u) => {
+                tracing::info!(worker = ctx.worker_id, "io_uring enabled for batched writev");
+                Some(u)
+            }
+            Err(e) => {
+                tracing::warn!(worker = ctx.worker_id, error = %e, "io_uring unavailable; sync I/O");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let defer_flush = uring.is_some();
     poll.registry()
         .register(&mut listener, TOKEN_LISTENER, Interest::READABLE)
         .expect("register listener");
@@ -130,6 +146,7 @@ pub async fn run(
 
         let mut did_work = false;
         let mut woke_for_shards = false;
+        let mut touched: Vec<usize> = Vec::new();
         {
             let mut guard = ctx.local_shards.borrow_mut();
             let shards = guard.as_mut_slice();
@@ -158,16 +175,40 @@ pub async fn run(
                         }
                         let readable = event.is_readable();
                         let writable = event.is_writable();
+                        // Sync read (ET-safe drain); defer flush for io_uring write batching.
                         let closed = {
                             let conn = conns[idx].as_mut().unwrap();
-                            matches!(conn.drive(readable, writable, shards), DriveResult::Closed)
+                            matches!(
+                                conn.drive(readable, writable, shards, defer_flush),
+                                DriveResult::Closed
+                            )
                         };
                         if closed {
                             remove_conn(&mut poll, &mut conns, &mut free, idx);
                         } else {
+                            touched.push(idx);
                             track_async_waiter(&mut conns, &mut async_waiters, idx);
                             if let Some(conn) = conns[idx].as_mut() {
                                 reregister(&mut poll, conn);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ring) = uring.as_mut() {
+                // Small batches: sync write is cheaper than io_uring_enter.
+                // Large fan-out: collapse many writev into one enter.
+                if touched.len() >= 32 {
+                    uring_flush_pending(ring, &mut poll, &mut conns, &mut free, &touched);
+                } else {
+                    for &idx in &touched {
+                        if let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) {
+                            if conn.has_pending_out() {
+                                if conn.flush_sync().is_err() || conn.should_close_now() {
+                                    remove_conn(&mut poll, &mut conns, &mut free, idx);
+                                } else {
+                                    reregister(&mut poll, conn);
+                                }
                             }
                         }
                     }
@@ -200,7 +241,11 @@ pub async fn run(
                 &mut async_waiters,
                 &mut did_work,
                 guard.as_mut_slice(),
+                defer_flush,
             );
+        }
+        if let Some(ring) = uring.as_mut() {
+            uring_flush_pending(ring, &mut poll, &mut conns, &mut free, &async_waiters);
         }
 
         // 6) Drain complete?
@@ -255,8 +300,12 @@ pub async fn run(
                 &mut async_waiters,
                 &mut did_work,
                 guard.as_mut_slice(),
+                defer_flush,
             );
         }
+                if let Some(ring) = uring.as_mut() {
+                    uring_flush_pending(ring, &mut poll, &mut conns, &mut free, &async_waiters);
+                }
                 if async_waiters.is_empty() {
                     break;
                 }
@@ -292,7 +341,7 @@ pub async fn run(
                                 let mut guard = ctx.local_shards.borrow_mut();
                                 let conn = conns[idx].as_mut().unwrap();
                                 matches!(
-                                    conn.drive(readable, writable, guard.as_mut_slice()),
+                                    conn.drive(readable, writable, guard.as_mut_slice(), defer_flush),
                                     DriveResult::Closed
                                 )
                             };
@@ -328,8 +377,12 @@ pub async fn run(
                 &mut async_waiters,
                 &mut did_work,
                 guard.as_mut_slice(),
+                defer_flush,
             );
         }
+                    if let Some(ring) = uring.as_mut() {
+                        uring_flush_pending(ring, &mut poll, &mut conns, &mut free, &async_waiters);
+                    }
                     if async_waiters.is_empty() {
                         break;
                     }
@@ -371,7 +424,7 @@ pub async fn run(
                                 let mut guard = ctx.local_shards.borrow_mut();
                                 let conn = conns[idx].as_mut().unwrap();
                                 matches!(
-                                    conn.drive(readable, writable, guard.as_mut_slice()),
+                                    conn.drive(readable, writable, guard.as_mut_slice(), defer_flush),
                                     DriveResult::Closed
                                 )
                             };
@@ -408,8 +461,12 @@ pub async fn run(
                 &mut async_waiters,
                 &mut did_work,
                 guard.as_mut_slice(),
+                defer_flush,
             );
         }
+                if let Some(ring) = uring.as_mut() {
+                    uring_flush_pending(ring, &mut poll, &mut conns, &mut free, &async_waiters);
+                }
                 tokio::task::yield_now().await;
             }
             continue;
@@ -452,7 +509,7 @@ pub async fn run(
                             let mut guard = ctx.local_shards.borrow_mut();
                             let conn = conns[idx].as_mut().unwrap();
                             matches!(
-                                conn.drive(readable, writable, guard.as_mut_slice()),
+                                conn.drive(readable, writable, guard.as_mut_slice(), defer_flush),
                                 DriveResult::Closed
                             )
                         };
@@ -484,6 +541,38 @@ pub async fn run(
     }
 }
 
+
+fn uring_flush_pending(
+    ring: &mut UringBatch,
+    poll: &mut Poll,
+    conns: &mut Vec<Option<Connection>>,
+    free: &mut Vec<usize>,
+    idxs: &[usize],
+) {
+    let send_idxs: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            conns
+                .get(idx)
+                .and_then(|c| c.as_ref())
+                .map(|c| c.has_pending_out())
+                .unwrap_or(false)
+        })
+        .collect();
+    if send_idxs.is_empty() {
+        return;
+    }
+    for idx in ring.send_pending(conns, &send_idxs) {
+        remove_conn(poll, conns, free, idx);
+    }
+    for &idx in &send_idxs {
+        if let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) {
+            reregister(poll, conn);
+        }
+    }
+}
+
 fn harvest_async_waiters(
     poll: &mut Poll,
     conns: &mut Vec<Option<Connection>>,
@@ -491,6 +580,7 @@ fn harvest_async_waiters(
     async_waiters: &mut Vec<usize>,
     did_work: &mut bool,
     shards: &mut [crate::storage::shard::Shard],
+    defer_flush: bool,
 ) {
     let mut wi = 0;
     while wi < async_waiters.len() {
@@ -506,7 +596,7 @@ fn harvest_async_waiters(
         }
         if conn.poll_async() {
             *did_work = true;
-            let closed = matches!(conn.drive(false, true, shards), DriveResult::Closed);
+            let closed = matches!(conn.drive(false, true, shards, defer_flush), DriveResult::Closed);
             if closed {
                 remove_conn(poll, conns, free, idx);
                 async_waiters.swap_remove(wi);
@@ -666,5 +756,15 @@ fn reregister(poll: &mut Poll, conn: &mut Connection) {
         } else {
             conn.set_registered(want);
         }
+    }
+}
+
+fn env_flag_true(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(
+            v.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        ),
+        Err(_) => false,
     }
 }
