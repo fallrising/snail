@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Buf, Bytes, BytesMut};
 use mio::net::TcpStream;
 use mio::{Interest, Token};
 use tokio::sync::oneshot;
@@ -17,6 +17,7 @@ use crate::command::{Command, SetOptions};
 use crate::config::Config;
 use crate::error::{protocol_err_reply, CommandError, ProtocolError};
 use crate::net::buffer::BufferPool;
+use crate::net::outbuf::OutBuf;
 use crate::protocol::encoder;
 use crate::protocol::frame::Reply;
 use crate::protocol::parser::Parser;
@@ -57,10 +58,9 @@ pub enum DriveResult {
 pub struct Connection {
     pub stream: TcpStream,
     read_buf: BytesMut,
-    out_buf: BytesMut,
+    out_buf: OutBuf,
     parser: Parser,
     pending: VecDeque<ReplySlot>,
-    bytes_pending: usize,
     state: ConnState,
     pool: Rc<BufferPool>,
     ctx: ConnContext,
@@ -96,10 +96,9 @@ impl Connection {
         Self {
             stream,
             read_buf: pool.get(ctx.config.read_buf_init),
-            out_buf: BytesMut::with_capacity(4096),
+            out_buf: OutBuf::with_capacity(4096),
             parser: Parser::new(),
             pending: VecDeque::new(),
-            bytes_pending: 0,
             state: ConnState::Normal,
             pool,
             ctx,
@@ -121,8 +120,8 @@ impl Connection {
     ) -> Self {
         let _ = stream.set_nodelay(true);
         let msg = b"-ERR max number of clients reached\r\n";
-        let mut out_buf = BytesMut::with_capacity(64);
-        out_buf.extend_from_slice(msg);
+        let mut out_buf = OutBuf::with_capacity(64);
+        out_buf.push_slice(msg);
         let dispatcher = Dispatcher {
             worker_id: ctx.worker_id,
             shard_map: ctx.shard_map.clone(),
@@ -138,7 +137,6 @@ impl Connection {
             out_buf,
             parser: Parser::new(),
             pending: VecDeque::new(),
-            bytes_pending: msg.len(),
             state: ConnState::CloseAfterFlush,
             pool,
             ctx,
@@ -176,7 +174,8 @@ impl Connection {
     }
 
     /// Drive this connection from a mio readiness event (or opportunistic pass).
-    pub fn drive(&mut self, readable: bool, writable: bool) -> DriveResult {
+    /// `shards` is the worker's local shard slice (already borrowed by the reactor).
+    pub fn drive(&mut self, readable: bool, writable: bool, shards: &mut [Shard]) -> DriveResult {
         let _ = self.try_harvest();
 
         if writable || !self.out_buf.is_empty() {
@@ -193,7 +192,7 @@ impl Connection {
             return DriveResult::Closed;
         }
 
-        if self.bytes_pending > self.ctx.config.out_buf_hard {
+        if self.out_buf.pending() > self.ctx.config.out_buf_hard {
             self.release_buffers();
             return DriveResult::Closed;
         }
@@ -208,7 +207,7 @@ impl Connection {
         }
 
         if readable && self.can_read() {
-            match self.try_read() {
+            match self.try_read(shards) {
                 Ok(false) => {
                     self.release_buffers();
                     return DriveResult::Closed;
@@ -269,9 +268,7 @@ impl Connection {
             if front.ready.is_some() {
                 let slot = self.pending.pop_front().unwrap();
                 if let Some(reply) = slot.ready {
-                    let before = self.out_buf.len();
-                    encoder::encode(&reply, &mut self.out_buf);
-                    self.bytes_pending += self.out_buf.len() - before;
+                    self.encode_hot(&reply);
                     progress = true;
                 }
             } else {
@@ -285,26 +282,11 @@ impl Connection {
     }
 
     fn try_flush(&mut self) -> io::Result<()> {
-        while !self.out_buf.is_empty() {
-            match self.stream.write(&self.out_buf) {
-                Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "write zero")),
-                Ok(n) => {
-                    let _ = self.out_buf.split_to(n);
-                    self.bytes_pending = self.bytes_pending.saturating_sub(n);
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Err(e),
-                Err(e) => return Err(e),
-            }
-        }
-        // Reclaim oversized out_buf after a full flush under load.
-        if self.out_buf.capacity() > 64 * 1024 && self.out_buf.is_empty() {
-            self.out_buf = BytesMut::with_capacity(4096);
-        }
-        Ok(())
+        self.out_buf.flush_to(&mut self.stream)
     }
 
     /// Ok(true) = read data, Ok(false) = EOF.
-    fn try_read(&mut self) -> io::Result<bool> {
+    fn try_read(&mut self, shards: &mut [Shard]) -> io::Result<bool> {
         if self.read_buf.capacity() == 0 {
             self.read_buf = self.pool.get(self.ctx.config.read_buf_init);
         }
@@ -332,8 +314,8 @@ impl Connection {
                 self.read_buf.set_len(len + n);
             }
             read_any = true;
-            if let Err(e) = self.process_input() {
-                self.enqueue_err(protocol_err_reply(&e));
+            if let Err(e) = self.process_input(shards) {
+                self.enqueue_err(&protocol_err_reply(&e));
                 self.state = ConnState::CloseAfterFlush;
                 break;
             }
@@ -343,28 +325,7 @@ impl Connection {
         }
 
         self.maybe_return_read_buf();
-        if read_any {
-            self.set_quickack();
-        }
         Ok(read_any)
-    }
-
-    #[inline]
-    fn set_quickack(&self) {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let on: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(
-                    self.stream.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    libc::TCP_QUICKACK,
-                    &on as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&on) as libc::socklen_t,
-                );
-            }
-        }
     }
 
     fn maybe_return_read_buf(&mut self) {
@@ -382,7 +343,7 @@ impl Connection {
 
     fn can_read(&self) -> bool {
         !matches!(self.state, ConnState::CloseAfterFlush)
-            && self.bytes_pending < self.ctx.config.out_buf_soft
+            && self.out_buf.pending() < self.ctx.config.out_buf_soft
             && self.pending.len() < self.ctx.config.pipeline_cap
     }
 
@@ -419,8 +380,24 @@ impl Connection {
         self.async_wait = true;
     }
 
-    fn process_input(&mut self) -> Result<(), ProtocolError> {
+    fn process_input(&mut self, shards: &mut [Shard]) -> Result<(), ProtocolError> {
         loop {
+            // Fast path: plain GET/SET without building Frame/Command.
+            if self.pending.is_empty() && self.parser.is_idle() {
+                match try_parse_hot_get_set(&mut self.read_buf) {
+                    HotParse::Get(key) => {
+                        self.apply_hot_get(key, shards);
+                        continue;
+                    }
+                    HotParse::Set(key, val) => {
+                        self.apply_hot_set(key, val, shards);
+                        continue;
+                    }
+                    HotParse::None => {}
+                    HotParse::NeedMore => break,
+                }
+            }
+
             match self.parser.next_frame(&mut self.read_buf, &self.ctx.config)? {
                 Some(frame) => {
                     let cmd = match parse(&frame) {
@@ -437,8 +414,7 @@ impl Connection {
                         return Ok(());
                     }
 
-                    // Hot path / normal dispatch. None ⇒ already written or async queued.
-                    if let Some(reply) = self.try_local_fast(cmd) {
+                    if let Some(reply) = self.try_local_fast(cmd, shards) {
                         self.enqueue_immediate(reply);
                     }
                 }
@@ -448,7 +424,67 @@ impl Connection {
         Ok(())
     }
 
-    fn try_local_fast(&mut self, cmd: Command) -> Option<Reply> {
+    #[inline]
+    fn apply_hot_get(&mut self, key: Bytes, shards: &mut [Shard]) {
+        let now = *self.ctx.now_ms.borrow();
+        let shard_id = self.ctx.shard_map.shard_of(&key);
+        if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
+            self.dispatcher.now_ms = now;
+            match self.dispatcher.dispatch_on(
+                Command::Get(key),
+                shards,
+                self.ctx.local_shard_base,
+            ) {
+                crate::command::dispatcher::DispatchResult::Immediate(r) => {
+                    self.encode_hot(&r);
+                }
+                crate::command::dispatcher::DispatchResult::Pending(rx) => {
+                    self.push_async(rx);
+                }
+            }
+            return;
+        }
+        let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+        let idx = idx.min(shards.len().saturating_sub(1));
+        let reply = string::apply_get(&mut shards[idx], &key, now);
+        self.encode_hot(&reply);
+    }
+
+    #[inline]
+    fn apply_hot_set(&mut self, key: Bytes, val: Bytes, shards: &mut [Shard]) {
+        let now = *self.ctx.now_ms.borrow();
+        let opts = SetOptions::default();
+        let shard_id = self.ctx.shard_map.shard_of(&key);
+        if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
+            self.dispatcher.now_ms = now;
+            match self.dispatcher.dispatch_on(
+                Command::Set(key, val, opts),
+                shards,
+                self.ctx.local_shard_base,
+            ) {
+                crate::command::dispatcher::DispatchResult::Immediate(r) => {
+                    self.encode_hot(&r);
+                }
+                crate::command::dispatcher::DispatchResult::Pending(rx) => {
+                    self.push_async(rx);
+                }
+            }
+            return;
+        }
+        let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+        let idx = idx.min(shards.len().saturating_sub(1));
+        let reply = string::apply_set(
+            &mut shards[idx],
+            key,
+            val,
+            opts,
+            now,
+            &self.ctx.config,
+        );
+        self.encode_hot(&reply);
+    }
+
+    fn try_local_fast(&mut self, cmd: Command, shards: &mut [Shard]) -> Option<Reply> {
         let now = *self.ctx.now_ms.borrow();
         match cmd {
             Command::Ping(None) => {
@@ -464,7 +500,11 @@ impl Connection {
                 let shard_id = self.ctx.shard_map.shard_of(&k);
                 if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
                     self.dispatcher.now_ms = now;
-                    return match self.dispatcher.dispatch(Command::Get(k)) {
+                    return match self.dispatcher.dispatch_on(
+                        Command::Get(k),
+                        shards,
+                        self.ctx.local_shard_base,
+                    ) {
                         crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                         crate::command::dispatcher::DispatchResult::Pending(rx) => {
                             self.push_async(rx);
@@ -472,12 +512,9 @@ impl Connection {
                         }
                     };
                 }
-                let reply = {
-                    let mut shards = self.ctx.local_shards.borrow_mut();
-                    let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
-                    let idx = idx.min(shards.len().saturating_sub(1));
-                    string::apply_get(&mut shards[idx], &k, now)
-                };
+                let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+                let idx = idx.min(shards.len().saturating_sub(1));
+                let reply = string::apply_get(&mut shards[idx], &k, now);
                 if self.pending.is_empty() {
                     self.encode_hot(&reply);
                     None
@@ -489,7 +526,11 @@ impl Connection {
                 let shard_id = self.ctx.shard_map.shard_of(&k);
                 if self.ctx.shard_map.owner_of(shard_id) != self.ctx.worker_id {
                     self.dispatcher.now_ms = now;
-                    return match self.dispatcher.dispatch(Command::Set(k, v, opts)) {
+                    return match self.dispatcher.dispatch_on(
+                        Command::Set(k, v, opts),
+                        shards,
+                        self.ctx.local_shard_base,
+                    ) {
                         crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                         crate::command::dispatcher::DispatchResult::Pending(rx) => {
                             self.push_async(rx);
@@ -497,19 +538,16 @@ impl Connection {
                         }
                     };
                 }
-                let reply = {
-                    let mut shards = self.ctx.local_shards.borrow_mut();
-                    let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
-                    let idx = idx.min(shards.len().saturating_sub(1));
-                    string::apply_set(
-                        &mut shards[idx],
-                        k,
-                        v,
-                        opts,
-                        now,
-                        &self.ctx.config,
-                    )
-                };
+                let idx = shard_id.saturating_sub(self.ctx.local_shard_base);
+                let idx = idx.min(shards.len().saturating_sub(1));
+                let reply = string::apply_set(
+                    &mut shards[idx],
+                    k,
+                    v,
+                    opts,
+                    now,
+                    &self.ctx.config,
+                );
                 if self.pending.is_empty() {
                     self.encode_hot(&reply);
                     None
@@ -519,7 +557,10 @@ impl Connection {
             }
             other => {
                 self.dispatcher.now_ms = now;
-                match self.dispatcher.dispatch(other) {
+                match self
+                    .dispatcher
+                    .dispatch_on(other, shards, self.ctx.local_shard_base)
+                {
                     crate::command::dispatcher::DispatchResult::Immediate(r) => Some(r),
                     crate::command::dispatcher::DispatchResult::Pending(rx) => {
                         self.push_async(rx);
@@ -532,22 +573,23 @@ impl Connection {
 
     #[inline]
     fn write_static(&mut self, bytes: &'static [u8]) {
-        self.out_buf.extend_from_slice(bytes);
-        self.bytes_pending += bytes.len();
+        self.out_buf.push_static(bytes);
     }
 
     /// Encode common hot-path replies without going through `Reply::Simple` formatting.
     #[inline]
     fn encode_hot(&mut self, reply: &Reply) {
-        let before = self.out_buf.len();
         match reply {
-            Reply::Ok => self.out_buf.extend_from_slice(encoder::OK),
-            Reply::NullBulk => self.out_buf.extend_from_slice(encoder::NULL_BULK),
-            Reply::Simple(s) if s == "PONG" => self.out_buf.extend_from_slice(encoder::PONG),
-            Reply::Bulk(b) => encoder::encode_bulk(b, &mut self.out_buf),
-            other => encoder::encode(other, &mut self.out_buf),
+            Reply::Ok => self.out_buf.push_static(encoder::OK),
+            Reply::NullBulk => self.out_buf.push_static(encoder::NULL_BULK),
+            Reply::Simple(s) if s == "PONG" => self.out_buf.push_static(encoder::PONG),
+            Reply::Bulk(b) => self.out_buf.push_bulk(b),
+            other => {
+                let mut tmp = BytesMut::with_capacity(64);
+                encoder::encode(other, &mut tmp);
+                self.out_buf.push_slice(&tmp);
+            }
         }
-        self.bytes_pending += self.out_buf.len() - before;
     }
 
     fn enqueue_immediate(&mut self, reply: Reply) {
@@ -561,10 +603,8 @@ impl Connection {
         }
     }
 
-    fn enqueue_err(&mut self, msg: String) {
-        let before = self.out_buf.len();
-        self.out_buf.extend_from_slice(msg.as_bytes());
-        self.bytes_pending += self.out_buf.len() - before;
+    fn enqueue_err(&mut self, msg: &str) {
+        self.out_buf.push_slice(msg.as_bytes());
     }
 
     fn enqueue_cmd_err(&mut self, err: CommandError) {
@@ -584,4 +624,127 @@ impl Drop for Connection {
             self.ctx.conn_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+enum HotParse {
+    Get(Bytes),
+    Set(Bytes, Bytes),
+    /// Not a plain GET/SET — fall through to general parser.
+    None,
+    /// Looks like GET/SET but incomplete.
+    NeedMore,
+}
+
+/// Specialized parser for `*2\r\n$3\r\nGET\r\n$N\r\nkey\r\n` and plain `SET key val`.
+fn try_parse_hot_get_set(buf: &mut BytesMut) -> HotParse {
+    // Minimum GET: *2\r\n$3\r\nGET\r\n$1\r\nk\r\n = 20 bytes
+    if buf.len() < 13 {
+        return if buf.is_empty() || buf.first() == Some(&b'*') {
+            HotParse::NeedMore
+        } else {
+            HotParse::None
+        };
+    }
+    if !buf.starts_with(b"*2\r\n$3\r\n") {
+        return HotParse::None;
+    }
+    let is_get = buf[8..11] == *b"GET";
+    let is_set = buf[8..11] == *b"SET";
+    if !is_get && !is_set {
+        return HotParse::None;
+    }
+    if buf[11] != b'\r' || buf[12] != b'\n' {
+        return HotParse::None;
+    }
+    if buf.len() < 14 {
+        return HotParse::NeedMore;
+    }
+    if buf[13] != b'$' {
+        return HotParse::None;
+    }
+
+    let Some((key_len, key_hdr)) = parse_len_line(&buf[14..]) else {
+        return if buf.len() < 48 {
+            HotParse::NeedMore
+        } else {
+            HotParse::None
+        };
+    };
+    let key_start = 14 + key_hdr;
+    let key_end = key_start + key_len;
+    let after_key = key_end + 2;
+    if buf.len() < after_key {
+        return HotParse::NeedMore;
+    }
+    if buf[key_end] != b'\r' || buf[key_end + 1] != b'\n' {
+        return HotParse::None;
+    }
+
+    if is_get {
+        let _ = buf.split_to(key_start);
+        let key = buf.split_to(key_len).freeze();
+        buf.advance(2);
+        return HotParse::Get(key);
+    }
+
+    // SET: parse value bulk
+    if buf.len() <= after_key {
+        return HotParse::NeedMore;
+    }
+    if buf[after_key] != b'$' {
+        return HotParse::None;
+    }
+    let Some((val_len, val_hdr)) = parse_len_line(&buf[after_key + 1..]) else {
+        return if buf.len() - after_key < 48 {
+            HotParse::NeedMore
+        } else {
+            HotParse::None
+        };
+    };
+    let val_start = after_key + 1 + val_hdr;
+    let val_end = val_start + val_len;
+    let after_val = val_end + 2;
+    if buf.len() < after_val {
+        return HotParse::NeedMore;
+    }
+    if buf[val_end] != b'\r' || buf[val_end + 1] != b'\n' {
+        return HotParse::None;
+    }
+
+    let _ = buf.split_to(key_start);
+    let key = buf.split_to(key_len).freeze();
+    buf.advance(2); // key CRLF
+    // Now buf starts at '$' of value
+    let val_hdr_total = 1 + val_hdr; // '$' + len line
+    let _ = buf.split_to(val_hdr_total);
+    let val = buf.split_to(val_len).freeze();
+    buf.advance(2);
+    HotParse::Set(key, val)
+}
+
+fn parse_len_line(buf: &[u8]) -> Option<(usize, usize)> {
+    // returns (value, bytes consumed including CRLF)
+    if buf.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if b == b'\r' {
+            if i + 1 >= buf.len() || buf[i + 1] != b'\n' || i == 0 {
+                return None;
+            }
+            return Some((n, i + 2));
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+        i += 1;
+        if i > 18 {
+            return None;
+        }
+    }
+    None
 }

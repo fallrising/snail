@@ -33,7 +33,7 @@ pub async fn run(
     info!(worker = ctx.worker_id, %addr, "listening");
 
     let mut poll = Poll::new().expect("mio poll");
-    let mut events = Events::with_capacity(1024);
+    let mut events = Events::with_capacity(4096);
     poll.registry()
         .register(&mut listener, TOKEN_LISTENER, Interest::READABLE)
         .expect("register listener");
@@ -130,41 +130,45 @@ pub async fn run(
 
         let mut did_work = false;
         let mut woke_for_shards = false;
-        for event in events.iter() {
-            did_work = true;
-            match event.token() {
-                TOKEN_LISTENER if accepting => {
-                    accept_ready(
-                        &mut listener,
-                        &mut poll,
-                        &mut conns,
-                        &mut free,
-                        &ctx,
-                        &conn_ctx,
-                        &pool,
-                    );
-                }
-                TOKEN_WAKE => {
-                    woke_for_shards = true;
-                }
-                TOKEN_LISTENER => {}
-                token => {
-                    let idx = token.0.saturating_sub(CONN_TOKEN_BASE);
-                    if idx >= conns.len() || conns[idx].is_none() {
-                        continue;
+        {
+            let mut guard = ctx.local_shards.borrow_mut();
+            let shards = guard.as_mut_slice();
+            for event in events.iter() {
+                did_work = true;
+                match event.token() {
+                    TOKEN_LISTENER if accepting => {
+                        accept_ready(
+                            &mut listener,
+                            &mut poll,
+                            &mut conns,
+                            &mut free,
+                            &ctx,
+                            &conn_ctx,
+                            &pool,
+                        );
                     }
-                    let readable = event.is_readable();
-                    let writable = event.is_writable();
-                    let closed = {
-                        let conn = conns[idx].as_mut().unwrap();
-                        matches!(conn.drive(readable, writable), DriveResult::Closed)
-                    };
-                    if closed {
-                        remove_conn(&mut poll, &mut conns, &mut free, idx);
-                    } else {
-                        track_async_waiter(&mut conns, &mut async_waiters, idx);
-                        if let Some(conn) = conns[idx].as_mut() {
-                            reregister(&mut poll, conn);
+                    TOKEN_WAKE => {
+                        woke_for_shards = true;
+                    }
+                    TOKEN_LISTENER => {}
+                    token => {
+                        let idx = token.0.saturating_sub(CONN_TOKEN_BASE);
+                        if idx >= conns.len() || conns[idx].is_none() {
+                            continue;
+                        }
+                        let readable = event.is_readable();
+                        let writable = event.is_writable();
+                        let closed = {
+                            let conn = conns[idx].as_mut().unwrap();
+                            matches!(conn.drive(readable, writable, shards), DriveResult::Closed)
+                        };
+                        if closed {
+                            remove_conn(&mut poll, &mut conns, &mut free, idx);
+                        } else {
+                            track_async_waiter(&mut conns, &mut async_waiters, idx);
+                            if let Some(conn) = conns[idx].as_mut() {
+                                reregister(&mut poll, conn);
+                            }
                         }
                     }
                 }
@@ -187,13 +191,17 @@ pub async fn run(
         }
 
         // 5) Harvest async replies only for known waiters (not O(conns)).
-        harvest_async_waiters(
-            &mut poll,
-            &mut conns,
-            &mut free,
-            &mut async_waiters,
-            &mut did_work,
-        );
+        {
+            let mut guard = ctx.local_shards.borrow_mut();
+            harvest_async_waiters(
+                &mut poll,
+                &mut conns,
+                &mut free,
+                &mut async_waiters,
+                &mut did_work,
+                guard.as_mut_slice(),
+            );
+        }
 
         // 6) Drain complete?
         if !accepting {
@@ -238,13 +246,17 @@ pub async fn run(
                     &ctx.now_ms,
                     &shard_range,
                 );
-                harvest_async_waiters(
-                    &mut poll,
-                    &mut conns,
-                    &mut free,
-                    &mut async_waiters,
-                    &mut did_work,
-                );
+                {
+            let mut guard = ctx.local_shards.borrow_mut();
+            harvest_async_waiters(
+                &mut poll,
+                &mut conns,
+                &mut free,
+                &mut async_waiters,
+                &mut did_work,
+                guard.as_mut_slice(),
+            );
+        }
                 if async_waiters.is_empty() {
                     break;
                 }
@@ -277,8 +289,12 @@ pub async fn run(
                             let readable = event.is_readable();
                             let writable = event.is_writable();
                             let closed = {
+                                let mut guard = ctx.local_shards.borrow_mut();
                                 let conn = conns[idx].as_mut().unwrap();
-                                matches!(conn.drive(readable, writable), DriveResult::Closed)
+                                matches!(
+                                    conn.drive(readable, writable, guard.as_mut_slice()),
+                                    DriveResult::Closed
+                                )
                             };
                             if closed {
                                 remove_conn(&mut poll, &mut conns, &mut free, idx);
@@ -303,13 +319,17 @@ pub async fn run(
                         &ctx.now_ms,
                         &shard_range,
                     );
-                    harvest_async_waiters(
-                        &mut poll,
-                        &mut conns,
-                        &mut free,
-                        &mut async_waiters,
-                        &mut did_work,
-                    );
+                    {
+            let mut guard = ctx.local_shards.borrow_mut();
+            harvest_async_waiters(
+                &mut poll,
+                &mut conns,
+                &mut free,
+                &mut async_waiters,
+                &mut did_work,
+                guard.as_mut_slice(),
+            );
+        }
                     if async_waiters.is_empty() {
                         break;
                     }
@@ -348,8 +368,12 @@ pub async fn run(
                             let readable = event.is_readable();
                             let writable = event.is_writable();
                             let closed = {
+                                let mut guard = ctx.local_shards.borrow_mut();
                                 let conn = conns[idx].as_mut().unwrap();
-                                matches!(conn.drive(readable, writable), DriveResult::Closed)
+                                matches!(
+                                    conn.drive(readable, writable, guard.as_mut_slice()),
+                                    DriveResult::Closed
+                                )
                             };
                             if closed {
                                 remove_conn(&mut poll, &mut conns, &mut free, idx);
@@ -375,13 +399,17 @@ pub async fn run(
                         &shard_range,
                     );
                 }
-                harvest_async_waiters(
-                    &mut poll,
-                    &mut conns,
-                    &mut free,
-                    &mut async_waiters,
-                    &mut did_work,
-                );
+                {
+            let mut guard = ctx.local_shards.borrow_mut();
+            harvest_async_waiters(
+                &mut poll,
+                &mut conns,
+                &mut free,
+                &mut async_waiters,
+                &mut did_work,
+                guard.as_mut_slice(),
+            );
+        }
                 tokio::task::yield_now().await;
             }
             continue;
@@ -421,8 +449,12 @@ pub async fn run(
                         let readable = event.is_readable();
                         let writable = event.is_writable();
                         let closed = {
+                            let mut guard = ctx.local_shards.borrow_mut();
                             let conn = conns[idx].as_mut().unwrap();
-                            matches!(conn.drive(readable, writable), DriveResult::Closed)
+                            matches!(
+                                conn.drive(readable, writable, guard.as_mut_slice()),
+                                DriveResult::Closed
+                            )
                         };
                         if closed {
                             remove_conn(&mut poll, &mut conns, &mut free, idx);
@@ -458,6 +490,7 @@ fn harvest_async_waiters(
     free: &mut Vec<usize>,
     async_waiters: &mut Vec<usize>,
     did_work: &mut bool,
+    shards: &mut [crate::storage::shard::Shard],
 ) {
     let mut wi = 0;
     while wi < async_waiters.len() {
@@ -473,7 +506,7 @@ fn harvest_async_waiters(
         }
         if conn.poll_async() {
             *did_work = true;
-            let closed = matches!(conn.drive(false, true), DriveResult::Closed);
+            let closed = matches!(conn.drive(false, true, shards), DriveResult::Closed);
             if closed {
                 remove_conn(poll, conns, free, idx);
                 async_waiters.swap_remove(wi);

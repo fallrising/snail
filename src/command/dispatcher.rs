@@ -56,6 +56,32 @@ impl Dispatcher {
         }
     }
 
+    /// Like `dispatch`, but local shard applies use `shards` (avoids nested RefCell borrow
+    /// when the reactor already holds `local_shards`).
+    pub fn dispatch_on(
+        &self,
+        cmd: Command,
+        shards: &mut [Shard],
+        local_shard_base: usize,
+    ) -> DispatchResult {
+        match route_class(&cmd) {
+            RouteClass::Local => {
+                DispatchResult::Immediate(self.exec_local_on(cmd, shards, local_shard_base))
+            }
+            RouteClass::Key => self.dispatch_key_on(cmd, shards, local_shard_base),
+            RouteClass::MultiDecompose | RouteClass::MultiGather => {
+                // Async gather uses RefCell later (after reactor drops the borrow).
+                self.dispatch(cmd)
+            }
+            RouteClass::Broadcast => {
+                DispatchResult::Immediate(self.dispatch_broadcast_on(cmd, shards))
+            }
+            RouteClass::CursorTargeted => {
+                DispatchResult::Immediate(self.dispatch_scan_on(cmd, shards, local_shard_base))
+            }
+        }
+    }
+
     fn clone_for_async(&self) -> Dispatcher {
         Dispatcher {
             worker_id: self.worker_id,
@@ -87,11 +113,48 @@ impl Dispatcher {
         }
     }
 
+    fn dispatch_key_on(
+        &self,
+        cmd: Command,
+        shards: &mut [Shard],
+        local_shard_base: usize,
+    ) -> DispatchResult {
+        if let Command::Rename(src, dst) | Command::RenameNx(src, dst) = &cmd {
+            let src_shard = self.shard_map.shard_of(src);
+            let dst_shard = self.shard_map.shard_of(dst);
+            if src_shard != dst_shard {
+                return DispatchResult::Immediate(crossslot_reply());
+            }
+        }
+
+        let key = primary_key(&cmd).expect("key command");
+        let shard_id = self.shard_map.shard_of(key);
+        if self.shard_map.owner_of(shard_id) == self.worker_id {
+            DispatchResult::Immediate(self.apply_on(shard_id, cmd, shards, local_shard_base))
+        } else {
+            let rx = self.shard_client.send_to(shard_id, cmd, self.worker_id);
+            DispatchResult::Pending(rx)
+        }
+    }
+
     fn apply_local(&self, shard_id: usize, cmd: Command) -> Reply {
         let mut shards = self.local_shards.borrow_mut();
         let idx = shard_id % shards.len();
         let shard = &mut shards[idx];
         apply::apply(shard, cmd, self.now_ms, &self.config, &self.info)
+    }
+
+    #[inline]
+    fn apply_on(
+        &self,
+        shard_id: usize,
+        cmd: Command,
+        shards: &mut [Shard],
+        local_shard_base: usize,
+    ) -> Reply {
+        let idx = shard_id.saturating_sub(local_shard_base);
+        let idx = idx.min(shards.len().saturating_sub(1));
+        apply::apply(&mut shards[idx], cmd, self.now_ms, &self.config, &self.info)
     }
 
     fn exec_local(&self, cmd: Command) -> Reply {
@@ -108,6 +171,28 @@ impl Dispatcher {
             _ => {
                 let shard_id = self.shard_map.local_shard_index(self.worker_id);
                 self.apply_local(shard_id, cmd)
+            }
+        }
+    }
+
+    fn exec_local_on(
+        &self,
+        cmd: Command,
+        shards: &mut [Shard],
+        local_shard_base: usize,
+    ) -> Reply {
+        match cmd {
+            Command::RandomKey => {
+                for shard in shards.iter() {
+                    if let Some(k) = shard.random_key() {
+                        return Reply::Bulk(k);
+                    }
+                }
+                Reply::NullBulk
+            }
+            _ => {
+                let shard_id = self.shard_map.local_shard_index(self.worker_id);
+                self.apply_on(shard_id, cmd, shards, local_shard_base)
             }
         }
     }
@@ -147,6 +232,46 @@ impl Dispatcher {
         }
     }
 
+    fn dispatch_broadcast_on(&self, cmd: Command, shards: &mut [Shard]) -> Reply {
+        match cmd {
+            Command::DbSize => {
+                let total: i64 = shards.iter().map(|s| s.len() as i64).sum();
+                Reply::Int(total)
+            }
+            Command::FlushDb | Command::FlushAll => {
+                for shard in shards.iter_mut() {
+                    shard.flush();
+                }
+                Reply::Ok
+            }
+            Command::Keys(pat) => {
+                let pattern = String::from_utf8_lossy(&pat).into_owned();
+                let mut keys = Vec::new();
+                for shard in shards.iter() {
+                    for k in shard.keys_matching(Some(&pattern)) {
+                        keys.push(Reply::Bulk(k));
+                    }
+                }
+                Reply::Array(keys)
+            }
+            Command::Info(section) => {
+                for shard in shards.iter_mut() {
+                    shard.flush_stats();
+                }
+                crate::command::server::build_info(&self.info, section.as_ref())
+            }
+            other => {
+                if shards.is_empty() {
+                    return Reply::Err(
+                        crate::protocol::frame::CommandErrKind::Generic,
+                        "no shard".into(),
+                    );
+                }
+                apply::apply(&mut shards[0], other, self.now_ms, &self.config, &self.info)
+            }
+        }
+    }
+
     fn dispatch_scan(&self, cmd: Command) -> Reply {
         let Command::Scan {
             cursor,
@@ -164,6 +289,50 @@ impl Dispatcher {
         let pat = pattern.as_ref().map(|p| String::from_utf8_lossy(p).into_owned());
         let mut shards = self.local_shards.borrow_mut();
         let idx = shard_id % shards.len();
+        let shard = &mut shards[idx];
+        let (next_local, keys) = shard.scan_step(local_cursor, count, pat.as_deref());
+        let next_shard = if next_local == 0 {
+            (shard_id + 1) % self.shard_map.num_shards()
+        } else {
+            shard_id
+        };
+        let next_cursor = if next_local == 0 && next_shard == 0 && keys.is_empty() {
+            0
+        } else {
+            encode_scan_cursor(
+                if next_local == 0 { next_shard } else { shard_id },
+                next_local,
+                self.shard_map.num_shards(),
+            )
+        };
+        let mut out = vec![Reply::Bulk(Bytes::from(next_cursor.to_string()))];
+        let key_replies: Vec<Reply> = keys.into_iter().map(|k| Reply::Bulk(k)).collect();
+        out.push(Reply::Array(key_replies));
+        Reply::Array(out)
+    }
+
+    fn dispatch_scan_on(
+        &self,
+        cmd: Command,
+        shards: &mut [Shard],
+        local_shard_base: usize,
+    ) -> Reply {
+        let Command::Scan {
+            cursor,
+            pattern,
+            count,
+        } = cmd
+        else {
+            return Reply::Err(
+                crate::protocol::frame::CommandErrKind::Generic,
+                "invalid scan".into(),
+            );
+        };
+        let (shard_id, local_cursor) =
+            decode_scan_cursor(cursor, self.shard_map.num_shards());
+        let pat = pattern.as_ref().map(|p| String::from_utf8_lossy(p).into_owned());
+        let idx = shard_id.saturating_sub(local_shard_base);
+        let idx = idx.min(shards.len().saturating_sub(1));
         let shard = &mut shards[idx];
         let (next_local, keys) = shard.scan_step(local_cursor, count, pat.as_deref());
         let next_shard = if next_local == 0 {

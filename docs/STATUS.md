@@ -15,20 +15,24 @@
 
 | 閘道 | 結果 |
 |---|---|
-| Gate hold10K+active64（1 worker） | **PASS** p99 ~1.3–1.5ms |
-| 同閘道多 worker（2w / 4w） | **PASS** p99 ~1.5–2.4ms（偶發噪音） |
-| Stress 10K 全活躍（pipeline=1） | 資訊；~100K req/s，p99 百 ms（Little's law） |
-| Stress 10K + pipeline=16 | 資訊；**~800K req/s** |
+| Gate hold10K+active64（1 worker） | **PASS** p99 ~1.0–1.5ms |
+| 同閘道多 worker（2w / 4w） | **PASS** p99 ~2–4ms（偶發噪音） |
+| Stress 10K 全活躍（pipeline=1） | 資訊；~70K req/s，p99 百 ms（Little's law） |
+| Stress 10K + pipeline=16 | 資訊；**~530–550K req/s** |
+| Peak（256 conn + P16） | 資訊；**~1.1–1.3M req/s** |
 
-## 本輪（吞吐熱路徑）
+## 本輪（writev + 熱路徑）
 
-- 讀路徑：直接讀入 `BytesMut` spare capacity（去掉 16KiB 中間緩衝）
-- 跨 shard 等待：adaptive spin（≤64 waiters 維持 48 次深 spin；全活躍時縮短避免 thrash）
-- `rudis-bench --pipeline/-P`：pipelined 全活躍壓測；`PIPELINE=` 傳入 `bench-c10k.sh`
-- 達 p99&lt;5ms@10K in-flight 約需 ~2M req/s（設計目標）；當前 pipelined ~0.8M
+- **writev OutBuf**：小回覆合併進 contiguous tail；大 bulk（>64B）零拷貝分段 `write_vectored`
+- **GET/SET 快路徑解析**：跳過 Frame/Command 建構，直接 apply + encode
+- **熱路徑去 RefCell 重入**：reactor 一次 borrow shards，傳入 `drive` / `dispatch_on`
+- 去掉每讀 `TCP_QUICKACK` setsockopt（降 syscall）
+- epoll events capacity 1024 → 4096
+- Peak pipelined：**~0.76M → ~1.1–1.3M** req/s；10K×P16 仍受 fd/調度限制（~0.55M）
+- 達 p99&lt;5ms@10K in-flight 約需 ~2M req/s；下一步 io_uring / 更緊 RPC
 
 ## 下一步
 
-1. 繼續抬全活躍吞吐（writev 批次、更緊 RPC、io_uring）
+1. 繼續抬全活躍吞吐（io_uring、多 worker 擴展時的跨 shard RPC）
 2. C1M hold
-3. 無鎖 cross-shard completion
+3. 無鎖 cross-shard completion；多 w gate 偶發噪音
