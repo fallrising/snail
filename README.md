@@ -9,8 +9,8 @@ Rust in-memory **Redis-compatible** server speaking **RESP2 over TCP**.
 | Milestone | State |
 |---|---|
 | M0 Skeleton | Done |
-| M1 Full semantics + multi-core | In progress (~90%) |
-| M2 Pressure layer (C100K) | In progress (mio reactor + graceful shutdown) |
+| M1 Full semantics + multi-core | Done (C10K gate PASS, 1w & multi-w) |
+| M2 Pressure layer (C100K) | In progress (mio reactor + C100K hold PASS) |
 | M3 Limits (C1M) | Planned |
 
 詳細進度、已知限制與下一步計畫見 [docs/STATUS.md](docs/STATUS.md)。  
@@ -122,8 +122,8 @@ C10K 驗收口徑：
 2. **Stress**（資訊）：10K 全活躍；達 p99&lt;5ms 約需 ~2M req/s
 
 **現況**：
+- **C10K gate：PASS**（1 worker p99 ~1.3ms；多 worker p99 ~1.5ms）
 - **C100K hold：PASS**（`LOOPBACK_SPREAD=64`）
-- C10K：`./scripts/bench-c10k.sh all`
 - 10K 全活躍 stress：~120K req/s ⇒ p99 ~170ms（非硬閘）
 
 ## Development
@@ -149,7 +149,7 @@ snail/
 
 ### Next steps
 
-1. 鎖定 C10K hold+ACTIVE gate；繼續抬吞吐 / 跨 shard
+1. 全活躍吞吐（pipeline、writev、io_uring）
 2. M3：io_uring / C1M hold
 
 ## License

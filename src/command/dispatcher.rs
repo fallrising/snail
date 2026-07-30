@@ -82,7 +82,7 @@ impl Dispatcher {
         if self.shard_map.owner_of(shard_id) == self.worker_id {
             DispatchResult::Immediate(self.apply_local(shard_id, cmd))
         } else {
-            let rx = self.shard_client.send_to(shard_id, cmd);
+            let rx = self.shard_client.send_to(shard_id, cmd, self.worker_id);
             DispatchResult::Pending(rx)
         }
     }
@@ -191,7 +191,7 @@ async fn send_shard(d: &Dispatcher, shard_id: usize, cmd: Command) -> Reply {
     if d.shard_map.owner_of(shard_id) == d.worker_id {
         d.apply_local(shard_id, cmd)
     } else {
-        let rx = d.shard_client.send_to(shard_id, cmd);
+        let rx = d.shard_client.send_to(shard_id, cmd, d.worker_id);
         rx.await.unwrap_or_else(|_| shard_unavailable())
     }
 }

@@ -24,6 +24,8 @@ pub struct ShardRequest {
     pub shard_id: ShardId,
     pub cmd: Command,
     pub reply: oneshot::Sender<Reply>,
+    /// Worker that is waiting on `reply` — woken after apply so it can harvest.
+    pub origin_worker: WorkerId,
 }
 
 #[derive(Clone)]
@@ -121,22 +123,37 @@ impl ShardClient {
         }
     }
 
-    pub fn send_to(&self, shard_id: ShardId, cmd: Command) -> oneshot::Receiver<Reply> {
+    /// Coalesced wake of a worker reactor (shard inbox and/or reply harvest).
+    #[inline]
+    pub fn wake(&self, worker_id: usize) {
+        if worker_id >= self.wake_pending.len() {
+            return;
+        }
+        if !self.wake_pending[worker_id].swap(true, Ordering::AcqRel) {
+            if let Some(w) = self.wakers[worker_id].get() {
+                let _ = w.wake();
+            }
+        }
+    }
+
+    pub fn send_to(
+        &self,
+        shard_id: ShardId,
+        cmd: Command,
+        origin_worker: WorkerId,
+    ) -> oneshot::Receiver<Reply> {
         let worker = self.shard_map.owner_of(shard_id);
         let (tx, rx) = oneshot::channel();
         let req = ShardRequest {
             shard_id,
             cmd,
             reply: tx,
+            origin_worker,
         };
         let sender = &self.senders[worker];
         let _ = sender.try_send(req);
         // First enqueue since last clear_wake → wake the owner reactor once.
-        if !self.wake_pending[worker].swap(true, Ordering::AcqRel) {
-            if let Some(w) = self.wakers[worker].get() {
-                let _ = w.wake();
-            }
-        }
+        self.wake(worker);
         rx
     }
 }

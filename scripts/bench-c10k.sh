@@ -14,7 +14,7 @@
 # Environment:
 #   PORT=6379  CLIENTS=10000  ACTIVE=64  REQUESTS=200
 #   STRESS_REQUESTS=50  WORKERS=1  SHARDS=1
-#   (default 1 worker avoids cross-shard oneshot tail; set WORKERS=0 for auto)
+#   (default 1 worker; multi-worker C10K gate also PASS — set WORKERS=0 for auto)
 
 set -euo pipefail
 
