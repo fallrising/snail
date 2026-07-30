@@ -29,7 +29,9 @@ const OP_SEND: u64 = 2;
 const OP_ACCEPT: u64 = 3;
 const OP_WAKE: u64 = 4;
 const MAX_IOV: usize = 16;
-const RING_ENTRIES: u32 = 8192;
+/// Must cover maxclients Recvs (+ AcceptMulti + wake + Sends). 32K fits C10K
+/// with headroom; `setup_clamp` lowers if the kernel rejects the size.
+const RING_ENTRIES: u32 = 32_768;
 
 #[inline]
 fn pack(op: u64, idx: u32) -> u64 {
@@ -92,7 +94,19 @@ struct CompletionRing {
 
 impl CompletionRing {
     fn try_new() -> io::Result<Self> {
-        let ring = IoUring::builder().build(RING_ENTRIES)?;
+        let ring = match IoUring::builder()
+            .setup_cqsize(RING_ENTRIES * 2)
+            .setup_clamp()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .build(RING_ENTRIES)
+        {
+            Ok(r) => r,
+            Err(_) => IoUring::builder()
+                .setup_cqsize(RING_ENTRIES * 2)
+                .setup_clamp()
+                .build(RING_ENTRIES)?,
+        };
         Ok(Self {
             ring,
             iov_by_conn: Vec::new(),
@@ -120,15 +134,11 @@ impl CompletionRing {
     }
 
     fn queue_recv(&mut self, idx: usize) {
-        if !self.pending_recv.contains(&idx) {
-            self.pending_recv.push(idx);
-        }
+        self.pending_recv.push(idx);
     }
 
     fn queue_send(&mut self, idx: usize) {
-        if !self.pending_send.contains(&idx) {
-            self.pending_send.push(idx);
-        }
+        self.pending_send.push(idx);
     }
 
     fn has_waitable(&self) -> bool {

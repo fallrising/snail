@@ -26,11 +26,11 @@
 - **AcceptMulti + eventfd wake** 同環；已移除 mio 與 50µs CQ timeout
 - 1w gate：**PASS**（本機 ~1.9ms）
 - Peak 256×P16：本機 **~1.2M**（優於同機 mio ~1.05M）
-- 10K×P16：仍略低於 mio（~0.38M vs ~0.43M）；尚未達 ~2M
+- 10K×P16：ring 32K 後與 mio 持平（~0.43M）；尚未達 ~2M
 - 多 w：可用；gate 偶發噪音與 mio 類似
 
 ## 下一步
 
-1. 抬 10K 全活躍吞吐（provided buffers / 更緊 harvest / 減 per-CQE 開銷）
+1. 抬全活躍吞吐（shared hot path / provided buffers / SQPOLL）向 ~2M@10K
 2. 實跑並壓穩 C1M hold
 3. 無鎖 cross-shard completion；多 w gate 偶發噪音
