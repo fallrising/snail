@@ -11,7 +11,7 @@ Rust in-memory **Redis-compatible** server speaking **RESP2 over TCP**.
 | M0 Skeleton | Done |
 | M1 Full semantics + multi-core | Done (C10K gate PASS, 1w & multi-w) |
 | M2 Pressure layer (C100K) | In progress (mio + C100K hold PASS) |
-| M3 Limits (C1M / io_uring) | In progress (`RUDIS_IO_URING=1` completion reactor; `scripts/bench-c1m.sh`) |
+| M3 Limits (C1M / io_uring) | In progress (`RUDIS_IO_URING=1`: AcceptMulti + eventfd + always-in-flight I/O; `scripts/bench-c1m.sh`) |
 
 詳細進度、已知限制與下一步計畫見 [docs/STATUS.md](docs/STATUS.md)。  
 架構設計見 [docs/design.md](docs/design.md)。

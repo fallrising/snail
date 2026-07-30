@@ -1,17 +1,17 @@
 //! Completion-style io_uring reactor: always-in-flight Recv/Send on data sockets.
 //!
-//! Listener + cross-shard wake stay on mio/epoll. Accepted connections are NOT
-//! registered with epoll; each live connection keeps a Recv outstanding (or a
-//! Send while flushing). Enable with `RUDIS_IO_URING=1`.
+//! Listener AcceptMulti + eventfd wake live on the same ring (no mio/epoll, no
+//! 50µs poll tax). Enable with `RUDIS_IO_URING=1`.
 
 use std::io::{self, ErrorKind};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use io_uring::{opcode, types, IoUring};
-use mio::net::TcpListener;
-use mio::{Events, Interest, Poll, Token};
+use io_uring::{cqueue, opcode, types, IoUring};
+use mio::net::TcpStream;
+use mio::Token;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
@@ -22,12 +22,12 @@ use crate::runtime::router::ShardRequest;
 use crate::runtime::worker::{current_ms, WorkerContext};
 use crate::storage::shard::Shard;
 
-const TOKEN_LISTENER: Token = Token(0);
-const TOKEN_WAKE: Token = Token(1);
 const CONN_TOKEN_BASE: usize = 2;
 
 const OP_RECV: u64 = 1;
 const OP_SEND: u64 = 2;
+const OP_ACCEPT: u64 = 3;
+const OP_WAKE: u64 = 4;
 const MAX_IOV: usize = 16;
 const RING_ENTRIES: u32 = 8192;
 
@@ -41,6 +41,37 @@ fn unpack(ud: u64) -> (u64, u32) {
     (ud >> 32, ud as u32)
 }
 
+struct EventFd {
+    fd: OwnedFd,
+}
+
+impl EventFd {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+        })
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    fn write_wake(&self) {
+        let one = 1u64;
+        let _ = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+}
+
 struct CompletionRing {
     ring: IoUring,
     /// Per-connection iovec scratch (stable while that conn's send is in flight).
@@ -49,7 +80,14 @@ struct CompletionRing {
     pending_recv: Vec<usize>,
     /// Conns that need a Send SQE.
     pending_send: Vec<usize>,
+    /// Data Recv/Send outstanding (AcceptMulti/Wake tracked separately).
     inflight: usize,
+    accept_armed: bool,
+    need_accept: bool,
+    wake_armed: bool,
+    need_wake: bool,
+    /// Stable buffer for eventfd Read completions.
+    wake_buf: u64,
 }
 
 impl CompletionRing {
@@ -61,6 +99,11 @@ impl CompletionRing {
             pending_recv: Vec::new(),
             pending_send: Vec::new(),
             inflight: 0,
+            accept_armed: false,
+            need_accept: true,
+            wake_armed: false,
+            need_wake: true,
+            wake_buf: 0,
         })
     }
 
@@ -88,8 +131,23 @@ impl CompletionRing {
         }
     }
 
-    fn flush_submissions(&mut self, conns: &mut [Option<Connection>]) {
-        // Grow iov table first.
+    fn has_waitable(&self) -> bool {
+        self.accept_armed
+            || self.wake_armed
+            || self.inflight > 0
+            || self.need_accept
+            || self.need_wake
+            || !self.pending_recv.is_empty()
+            || !self.pending_send.is_empty()
+    }
+
+    fn flush_submissions(
+        &mut self,
+        conns: &mut [Option<Connection>],
+        listener_fd: RawFd,
+        wake_fd: RawFd,
+        accepting: bool,
+    ) {
         let mut grow_to = self.iov_by_conn.len().saturating_sub(1);
         for &idx in self.pending_send.iter().chain(self.pending_recv.iter()) {
             grow_to = grow_to.max(idx);
@@ -102,9 +160,35 @@ impl CompletionRing {
         let recv_q = std::mem::take(&mut self.pending_recv);
         let mut send_pos = 0usize;
         let mut recv_pos = 0usize;
+        let mut pushed = false;
+        let wake_ptr = &mut self.wake_buf as *mut u64 as *mut u8;
 
         {
             let mut sq = self.ring.submission();
+
+            if accepting && self.need_accept && !self.accept_armed {
+                let entry = opcode::AcceptMulti::new(types::Fd(listener_fd))
+                    .flags(libc::SOCK_CLOEXEC)
+                    .build()
+                    .user_data(pack(OP_ACCEPT, 0));
+                if unsafe { sq.push(&entry) }.is_ok() {
+                    self.accept_armed = true;
+                    self.need_accept = false;
+                    pushed = true;
+                }
+            }
+
+            if self.need_wake && !self.wake_armed {
+                let entry = opcode::Read::new(types::Fd(wake_fd), wake_ptr, 8)
+                    .build()
+                    .user_data(pack(OP_WAKE, 0));
+                if unsafe { sq.push(&entry) }.is_ok() {
+                    self.wake_armed = true;
+                    self.need_wake = false;
+                    pushed = true;
+                }
+            }
+
             while send_pos < send_q.len() {
                 let idx = send_q[send_pos];
                 send_pos += 1;
@@ -129,6 +213,7 @@ impl CompletionRing {
                 }
                 conn.send_inflight = true;
                 self.inflight += 1;
+                pushed = true;
             }
             while recv_pos < recv_q.len() {
                 let idx = recv_q[recv_pos];
@@ -155,6 +240,7 @@ impl CompletionRing {
                 }
                 conn.recv_inflight = true;
                 self.inflight += 1;
+                pushed = true;
             }
         }
 
@@ -165,21 +251,17 @@ impl CompletionRing {
             self.pending_recv.extend_from_slice(&recv_q[recv_pos..]);
         }
 
-        if self.inflight > 0 || !self.pending_send.is_empty() || !self.pending_recv.is_empty() {
+        if pushed || self.inflight > 0 || self.accept_armed || self.wake_armed {
             let _ = self.ring.submit();
         }
     }
 
-    fn wait_cqe(&mut self, timeout_ns: u32) -> io::Result<()> {
-        if self.inflight == 0 {
+    fn wait_cqe(&mut self) -> io::Result<()> {
+        if !self.has_waitable() {
             return Ok(());
         }
-        // Bounded wait so mio accept/wake still run (idle Recvs would otherwise park forever).
-        let ts = types::Timespec::new().nsec(timeout_ns);
-        let args = types::SubmitArgs::new().timespec(&ts);
-        match self.ring.submitter().submit_with_args(1, &args) {
+        match self.ring.submit_and_wait(1) {
             Ok(_) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
             Err(e) if e.kind() == ErrorKind::Interrupted => Ok(()),
             Err(e) => Err(e),
         }
@@ -191,22 +273,46 @@ impl CompletionRing {
         shards: &mut [Shard],
         to_close: &mut Vec<usize>,
         async_waiters: &mut Vec<usize>,
+        new_fds: &mut Vec<RawFd>,
+        woke: &mut bool,
+        accepting: bool,
     ) {
         let mut cq = self.ring.completion();
         cq.sync();
         let mut requeue_send: Vec<usize> = Vec::new();
         let mut requeue_recv: Vec<usize> = Vec::new();
         for cqe in cq {
-            if self.inflight > 0 {
-                self.inflight -= 1;
-            }
             let (op, idx) = unpack(cqe.user_data());
             let idx = idx as usize;
-            let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
-                continue;
-            };
             match op {
+                OP_ACCEPT => {
+                    let res = cqe.result();
+                    if res >= 0 {
+                        new_fds.push(res);
+                    } else if res != -libc::ECANCELED {
+                        tracing::warn!("accept multi error: {}", io::Error::from_raw_os_error(-res));
+                    }
+                    if !cqueue::more(cqe.flags()) {
+                        self.accept_armed = false;
+                        if accepting {
+                            self.need_accept = true;
+                        }
+                    }
+                }
+                OP_WAKE => {
+                    self.wake_armed = false;
+                    self.need_wake = true;
+                    if cqe.result() > 0 {
+                        *woke = true;
+                    }
+                }
                 OP_RECV => {
+                    if self.inflight > 0 {
+                        self.inflight -= 1;
+                    }
+                    let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
+                        continue;
+                    };
                     conn.recv_inflight = false;
                     match conn.complete_recv(cqe.result(), shards) {
                         DriveResult::Closed => {
@@ -225,6 +331,12 @@ impl CompletionRing {
                     }
                 }
                 OP_SEND => {
+                    if self.inflight > 0 {
+                        self.inflight -= 1;
+                    }
+                    let Some(conn) = conns.get_mut(idx).and_then(|c| c.as_mut()) else {
+                        continue;
+                    };
                     conn.send_inflight = false;
                     match conn.complete_send(cqe.result()) {
                         DriveResult::Closed => {
@@ -266,6 +378,13 @@ fn track_async(conn: &mut Connection, waiters: &mut Vec<usize>, idx: usize) {
     }
 }
 
+fn stream_from_fd(fd: RawFd) -> io::Result<TcpStream> {
+    let std = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    // Blocking sockets: io_uring waits for readiness (avoids EAGAIN spin).
+    std.set_nonblocking(false)?;
+    Ok(TcpStream::from_std(std))
+}
+
 /// Run the completion reactor until shutdown. Returns Err only if ring setup fails.
 pub async fn run(
     ctx: WorkerContext,
@@ -275,16 +394,25 @@ pub async fn run(
 ) -> io::Result<()> {
     let mut ring = CompletionRing::try_new()?;
     let addr = ctx.config.socket_addr().expect("valid addr");
-    let mut listener = crate::net::listener::bind_reuseport_mio(addr, ctx.config.tcp_backlog)?;
+    let listener = crate::net::listener::bind_reuseport_std(addr, ctx.config.tcp_backlog)?;
+    let listener_fd = listener.as_raw_fd();
     info!(worker = ctx.worker_id, %addr, "listening (io_uring completion)");
 
-    let mut poll = Poll::new()?;
-    let mut events = Events::with_capacity(1024);
-    poll.registry()
-        .register(&mut listener, TOKEN_LISTENER, Interest::READABLE)?;
-    let waker = mio::Waker::new(poll.registry(), TOKEN_WAKE)?;
-    ctx.shard_client
-        .register_waker(ctx.worker_id, std::sync::Arc::new(waker));
+    let eventfd = EventFd::new()?;
+    let wake_fd = eventfd.as_raw_fd();
+    let wake_dup = unsafe { libc::dup(wake_fd) };
+    if wake_dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let efd_wake = std::sync::Arc::new(EventFd {
+        fd: unsafe { OwnedFd::from_raw_fd(wake_dup) },
+    });
+    ctx.shard_client.register_waker(
+        ctx.worker_id,
+        std::sync::Arc::new(move || {
+            efd_wake.write_wake();
+        }),
+    );
 
     let pool = Rc::new(BufferPool::default());
     let conn_ctx = ConnContext {
@@ -308,11 +436,12 @@ pub async fn run(
     let mut last_time_refresh = Instant::now();
     let expire_every = Duration::from_millis(ctx.config.expire_interval_ms.max(1));
     let shutdown_grace = Duration::from_secs(ctx.config.shutdown_deadline_secs.max(1));
+    let mut new_fds: Vec<RawFd> = Vec::new();
 
     tracing::info!(
         worker = ctx.worker_id,
         entries = RING_ENTRIES,
-        "io_uring completion reactor ready"
+        "io_uring completion reactor ready (AcceptMulti + eventfd)"
     );
 
     loop {
@@ -346,7 +475,7 @@ pub async fn run(
                 if accepting {
                     accepting = false;
                     drain_deadline = Some(Instant::now() + shutdown_grace);
-                    let _ = poll.registry().deregister(&mut listener);
+                    ring.need_accept = false;
                     for idx in 0..conns.len() {
                         if conns[idx].is_some() {
                             remove_conn(&mut conns, &mut free, idx);
@@ -359,81 +488,16 @@ pub async fn run(
                 if accepting {
                     accepting = false;
                     drain_deadline = Some(Instant::now() + shutdown_grace);
+                    ring.need_accept = false;
                 }
             }
         }
 
-        // Accept / wake via mio (non-blocking).
-        let _ = poll.poll(&mut events, Some(Duration::ZERO));
-        let mut woke = false;
-        for event in events.iter() {
-            match event.token() {
-                TOKEN_LISTENER if accepting => {
-                    accept_uring(
-                        &mut listener,
-                        &mut conns,
-                        &mut free,
-                        &ctx,
-                        &conn_ctx,
-                        &pool,
-                        &mut ring,
-                    );
-                }
-                TOKEN_WAKE => woke = true,
-                _ => {}
-            }
-        }
-        if woke {
-            ctx.shard_client.clear_wake(ctx.worker_id);
-            drain_shards(
-                &mut request_rx,
-                &ctx,
-                &shard_range,
-                &mut conns,
-                &mut async_waiters,
-                &mut ring,
-            );
-        }
-
-        // Harvest cross-shard replies → queue sends.
         harvest_and_queue(&mut conns, &mut async_waiters, &mut ring);
+        ring.flush_submissions(&mut conns, listener_fd, wake_fd, accepting);
 
-        ring.flush_submissions(&mut conns);
-
-        // Wait for I/O (or briefly park if nothing in flight).
-        if ring.inflight > 0 {
-            let _ = ring.wait_cqe(50_000); // 50µs — keep accept/wake responsive
-        } else if async_waiters.is_empty() {
-            let _ = poll.poll(&mut events, Some(Duration::from_millis(1)));
-            for event in events.iter() {
-                match event.token() {
-                    TOKEN_LISTENER if accepting => {
-                        accept_uring(
-                            &mut listener,
-                            &mut conns,
-                            &mut free,
-                            &ctx,
-                            &conn_ctx,
-                            &pool,
-                            &mut ring,
-                        );
-                    }
-                    TOKEN_WAKE => {
-                        ctx.shard_client.clear_wake(ctx.worker_id);
-                        drain_shards(
-                            &mut request_rx,
-                            &ctx,
-                            &shard_range,
-                            &mut conns,
-                            &mut async_waiters,
-                            &mut ring,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        } else {
-            // Spin briefly for cross-shard like the mio reactor.
+        // Brief spin when waiting on cross-shard replies (wake will unblock park).
+        if !async_waiters.is_empty() && ring.inflight == 0 {
             for _ in 0..16 {
                 drain_shards(
                     &mut request_rx,
@@ -449,11 +513,20 @@ pub async fn run(
                 }
                 std::hint::spin_loop();
             }
-            if !async_waiters.is_empty() {
-                tokio::task::yield_now().await;
-            }
+            ring.flush_submissions(&mut conns, listener_fd, wake_fd, accepting);
         }
 
+        if ring.has_waitable() {
+            let _ = ring.wait_cqe();
+        } else if !async_waiters.is_empty() {
+            tokio::task::yield_now().await;
+        } else {
+            // Truly idle (shutdown drain with nothing left): short sleep.
+            tokio::task::yield_now().await;
+        }
+
+        let mut woke = false;
+        new_fds.clear();
         let mut to_close = Vec::new();
         {
             let mut guard = ctx.local_shards.borrow_mut();
@@ -462,12 +535,40 @@ pub async fn run(
                 guard.as_mut_slice(),
                 &mut to_close,
                 &mut async_waiters,
+                &mut new_fds,
+                &mut woke,
+                accepting,
             );
         }
+
+        for fd in new_fds.drain(..) {
+            install_conn(
+                fd,
+                &mut conns,
+                &mut free,
+                &ctx,
+                &conn_ctx,
+                &pool,
+                &mut ring,
+            );
+        }
+
+        if woke {
+            ctx.shard_client.clear_wake(ctx.worker_id);
+            drain_shards(
+                &mut request_rx,
+                &ctx,
+                &shard_range,
+                &mut conns,
+                &mut async_waiters,
+                &mut ring,
+            );
+        }
+
         for idx in to_close {
             remove_conn(&mut conns, &mut free, idx);
         }
-        ring.flush_submissions(&mut conns);
+        ring.flush_submissions(&mut conns, listener_fd, wake_fd, accepting);
 
         if !accepting {
             let live = conns.iter().filter(|c| c.is_some()).count();
@@ -484,6 +585,49 @@ pub async fn run(
                 return Ok(());
             }
         }
+    }
+}
+
+fn install_conn(
+    fd: RawFd,
+    conns: &mut Vec<Option<Connection>>,
+    free: &mut Vec<usize>,
+    ctx: &WorkerContext,
+    conn_ctx: &ConnContext,
+    pool: &Rc<BufferPool>,
+    ring: &mut CompletionRing,
+) {
+    let stream = match stream_from_fd(fd) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("accept fd wrap error: {e}");
+            unsafe {
+                let _ = libc::close(fd);
+            }
+            return;
+        }
+    };
+    let current = ctx.conn_count.fetch_add(1, Ordering::Relaxed) + 1;
+    let idx = if let Some(i) = free.pop() {
+        i
+    } else {
+        let i = conns.len();
+        conns.push(None);
+        i
+    };
+    let token = Token(idx + CONN_TOKEN_BASE);
+    let conn = if current > ctx.config.maxclients {
+        ctx.conn_count.fetch_sub(1, Ordering::Relaxed);
+        Connection::rejected(stream, conn_ctx.clone(), pool.clone(), token)
+    } else {
+        Connection::new(stream, conn_ctx.clone(), pool.clone(), token)
+    };
+    let wants_send = conn.is_reject_only() || conn.has_pending_out();
+    conns[idx] = Some(conn);
+    if wants_send {
+        ring.queue_send(idx);
+    } else {
+        ring.queue_recv(idx);
     }
 }
 
@@ -565,64 +709,7 @@ fn drain_shards(
     for origin in wake_overflow {
         ctx.shard_client.wake(origin);
     }
-    // Origin is us: harvest local waiters promptly.
     harvest_and_queue(conns, async_waiters, ring);
-}
-
-fn accept_uring(
-    listener: &mut TcpListener,
-    conns: &mut Vec<Option<Connection>>,
-    free: &mut Vec<usize>,
-    ctx: &WorkerContext,
-    conn_ctx: &ConnContext,
-    pool: &Rc<BufferPool>,
-    ring: &mut CompletionRing,
-) {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let current = ctx.conn_count.fetch_add(1, Ordering::Relaxed) + 1;
-                let idx = if let Some(i) = free.pop() {
-                    i
-                } else {
-                    let i = conns.len();
-                    conns.push(None);
-                    i
-                };
-                let token = Token(idx + CONN_TOKEN_BASE);
-                // Do NOT register with mio — completion path owns the fd.
-                // Blocking sockets: io_uring waits for readiness (avoids EAGAIN spin).
-                {
-                    use std::os::fd::AsRawFd;
-                    let fd = stream.as_raw_fd();
-                    unsafe {
-                        let flags = libc::fcntl(fd, libc::F_GETFL);
-                        if flags >= 0 {
-                            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-                        }
-                    }
-                }
-                let conn = if current > ctx.config.maxclients {
-                    ctx.conn_count.fetch_sub(1, Ordering::Relaxed);
-                    Connection::rejected(stream, conn_ctx.clone(), pool.clone(), token)
-                } else {
-                    Connection::new(stream, conn_ctx.clone(), pool.clone(), token)
-                };
-                let wants_send = conn.is_reject_only() || conn.has_pending_out();
-                conns[idx] = Some(conn);
-                if wants_send {
-                    ring.queue_send(idx);
-                } else {
-                    ring.queue_recv(idx);
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(e) => {
-                tracing::warn!("accept error: {e}");
-                break;
-            }
-        }
-    }
 }
 
 fn remove_conn(conns: &mut Vec<Option<Connection>>, free: &mut Vec<usize>, idx: usize) {

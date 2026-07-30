@@ -39,7 +39,13 @@ pub async fn run(
         .expect("register listener");
     let waker = mio::Waker::new(poll.registry(), TOKEN_WAKE).expect("mio waker");
     // Expose waker to ShardClient so remote workers can unblock us.
-    ctx.shard_client.register_waker(ctx.worker_id, std::sync::Arc::new(waker));
+    let waker = std::sync::Arc::new(waker);
+    ctx.shard_client.register_waker(
+        ctx.worker_id,
+        std::sync::Arc::new(move || {
+            let _ = waker.wake();
+        }),
+    );
 
     let pool = Rc::new(BufferPool::default());
     let conn_ctx = ConnContext {

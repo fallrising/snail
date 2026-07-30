@@ -82,12 +82,15 @@ impl ShardMap {
     }
 }
 
+/// Cross-reactor wake (mio::Waker, eventfd write, …). Set once per worker.
+pub type ReactorWake = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ShardClient {
     senders: Arc<Vec<mpsc::Sender<ShardRequest>>>,
     shard_map: Arc<ShardMap>,
-    /// Per-worker mio wakers — set once each reactor starts (lock-free reads).
-    wakers: Arc<Vec<OnceLock<Arc<mio::Waker>>>>,
+    /// Per-worker wake hooks — set once each reactor starts (lock-free reads).
+    wakers: Arc<Vec<OnceLock<ReactorWake>>>,
     /// Coalesce wakes: only the first enqueue since last drain calls `wake()`.
     wake_pending: Arc<Vec<AtomicBool>>,
 }
@@ -109,7 +112,7 @@ impl ShardClient {
         }
     }
 
-    pub fn register_waker(&self, worker_id: usize, waker: Arc<mio::Waker>) {
+    pub fn register_waker(&self, worker_id: usize, waker: ReactorWake) {
         if worker_id < self.wakers.len() {
             let _ = self.wakers[worker_id].set(waker);
         }
@@ -131,7 +134,7 @@ impl ShardClient {
         }
         if !self.wake_pending[worker_id].swap(true, Ordering::AcqRel) {
             if let Some(w) = self.wakers[worker_id].get() {
-                let _ = w.wake();
+                w();
             }
         }
     }

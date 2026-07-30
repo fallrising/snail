@@ -31,10 +31,10 @@ pub async fn accept_loop(
     reactor::run(ctx, request_rx, shard_range, shutdown_rx).await;
 }
 
-pub fn bind_reuseport_mio(
+fn bind_reuseport_socket(
     addr: std::net::SocketAddr,
     backlog: u32,
-) -> std::io::Result<TcpListener> {
+) -> std::io::Result<std::net::TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -47,6 +47,19 @@ pub fn bind_reuseport_mio(
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(backlog as i32)?;
-    let std_listener: std::net::TcpListener = socket.into();
-    Ok(TcpListener::from_std(std_listener))
+    Ok(socket.into())
+}
+
+pub fn bind_reuseport_mio(
+    addr: std::net::SocketAddr,
+    backlog: u32,
+) -> std::io::Result<TcpListener> {
+    Ok(TcpListener::from_std(bind_reuseport_socket(addr, backlog)?))
+}
+
+pub fn bind_reuseport_std(
+    addr: std::net::SocketAddr,
+    backlog: u32,
+) -> std::io::Result<std::net::TcpListener> {
+    bind_reuseport_socket(addr, backlog)
 }
