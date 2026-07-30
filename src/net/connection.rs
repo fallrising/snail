@@ -296,6 +296,10 @@ impl Connection {
                 Err(e) => return Err(e),
             }
         }
+        // Reclaim oversized out_buf after a full flush under load.
+        if self.out_buf.capacity() > 64 * 1024 && self.out_buf.is_empty() {
+            self.out_buf = BytesMut::with_capacity(4096);
+        }
         Ok(())
     }
 
@@ -305,27 +309,36 @@ impl Connection {
             self.read_buf = self.pool.get(self.ctx.config.read_buf_init);
         }
 
-        let mut tmp = [0u8; 16 * 1024];
         let mut read_any = false;
         loop {
-            match self.stream.read(&mut tmp) {
-                Ok(0) => {
-                    return if read_any { Ok(true) } else { Ok(false) };
+            if self.read_buf.capacity() - self.read_buf.len() < 2048 {
+                self.read_buf.reserve(16 * 1024);
+            }
+            let len = self.read_buf.len();
+            let spare = self.read_buf.capacity() - len;
+            let n = unsafe {
+                let ptr = self.read_buf.as_mut_ptr().add(len);
+                let dst = std::slice::from_raw_parts_mut(ptr, spare);
+                match self.stream.read(dst) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
                 }
-                Ok(n) => {
-                    self.read_buf.extend_from_slice(&tmp[..n]);
-                    read_any = true;
-                    if let Err(e) = self.process_input() {
-                        self.enqueue_err(protocol_err_reply(&e));
-                        self.state = ConnState::CloseAfterFlush;
-                        break;
-                    }
-                    if !self.can_read() {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+            };
+            if n == 0 {
+                return if read_any { Ok(true) } else { Ok(false) };
+            }
+            unsafe {
+                self.read_buf.set_len(len + n);
+            }
+            read_any = true;
+            if let Err(e) = self.process_input() {
+                self.enqueue_err(protocol_err_reply(&e));
+                self.state = ConnState::CloseAfterFlush;
+                break;
+            }
+            if !self.can_read() {
+                break;
             }
         }
 

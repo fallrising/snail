@@ -122,9 +122,10 @@ C10K 驗收口徑：
 2. **Stress**（資訊）：10K 全活躍；達 p99&lt;5ms 約需 ~2M req/s
 
 **現況**：
-- **C10K gate：PASS**（1 worker p99 ~1.3ms；多 worker p99 ~1.5ms）
+- **C10K gate：PASS**（1 worker p99 ~1.3ms；多 worker p99 ~1.5–2.4ms）
 - **C100K hold：PASS**（`LOOPBACK_SPREAD=64`）
-- 10K 全活躍 stress：~120K req/s ⇒ p99 ~170ms（非硬閘）
+- 10K 全活躍 stress：~100K req/s（pipeline=1）；**~800K req/s**（`PIPELINE=16`）
+- 達 p99&lt;5ms@10K in-flight 約需 ~2M req/s（吞吐目標）
 
 ## Development
 
@@ -149,7 +150,7 @@ snail/
 
 ### Next steps
 
-1. 全活躍吞吐（pipeline、writev、io_uring）
+1. 全活躍吞吐繼續抬升（目標 ~2M req/s）
 2. M3：io_uring / C1M hold
 
 ## License

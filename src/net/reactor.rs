@@ -104,8 +104,6 @@ pub async fn run(
                     drain_deadline = Some(Instant::now() + shutdown_grace);
                     tracing::info!(worker = ctx.worker_id, "shutdown: draining connections");
                     let _ = poll.registry().deregister(&mut listener);
-                    // Immediately close all connections (flush-best-effort already done
-                    // on prior turns; under SIGTERM we prefer fast exit).
                     let len = conns.len();
                     for idx in 0..len {
                         if conns[idx].is_some() {
@@ -219,11 +217,16 @@ pub async fn run(
         }
 
         // 7) Waiting on cross-shard / LocalSet replies.
-        // Cooperative spin first: keep draining inbound shard RPCs so we don't
-        // stall peers that are waiting on *us* (avoids multi-worker livelock),
-        // while polling oneshots as soon as reply wakes land.
+        // Adaptive spin budget: few waiters → spin for latency; many (full-active)
+        // → short budget to avoid O(waiters×iters) harvest thrash.
         if !async_waiters.is_empty() {
-            for _ in 0..48 {
+            let spin_budget = match async_waiters.len() {
+                // C10K gate (≤64 active) must keep a deep spin for cross-shard p99.
+                0..=64 => 48,
+                65..=512 => 8,
+                _ => 2,
+            };
+            for _ in 0..spin_budget {
                 ctx.shard_client.clear_wake(ctx.worker_id);
                 drain_shard_requests(
                     &mut request_rx,
@@ -315,7 +318,7 @@ pub async fn run(
                 }
             }
             if !async_waiters.is_empty() {
-                // Short park for reply wake; then yield for LocalSet multi-gather.
+                // Short park for reply wake; yield for LocalSet multi-gather.
                 if let Err(e) = poll.poll(&mut events, Some(Duration::from_micros(20))) {
                     if e.kind() != ErrorKind::Interrupted {
                         tracing::warn!("mio poll error: {e}");
@@ -392,8 +395,6 @@ pub async fn run(
                     tracing::warn!("mio poll error: {e}");
                 }
             }
-            // Process any events that arrived during the blocking wait before looping
-            // back through shard/expire bookkeeping.
             let mut woke_for_shards = false;
             for event in events.iter() {
                 match event.token() {

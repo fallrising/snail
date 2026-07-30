@@ -13,8 +13,9 @@
 #
 # Environment:
 #   PORT=6379  CLIENTS=10000  ACTIVE=64  REQUESTS=200
-#   STRESS_REQUESTS=50  WORKERS=1  SHARDS=1
+#   STRESS_REQUESTS=50  WORKERS=1  SHARDS=1  PIPELINE=1
 #   (default 1 worker; multi-worker C10K gate also PASS — set WORKERS=0 for auto)
+#   PIPELINE>1 measures pipelined full-active throughput (informational)
 
 set -euo pipefail
 
@@ -27,6 +28,7 @@ REQUESTS="${REQUESTS:-200}"
 STRESS_REQUESTS="${STRESS_REQUESTS:-50}"
 WORKERS="${WORKERS:-1}"
 SHARDS="${SHARDS:-1}"
+PIPELINE="${PIPELINE:-1}"
 PIDFILE="/tmp/rudis-bench-${PORT}.pid"
 ULIMIT_TARGET="${ULIMIT_TARGET:-65536}"
 
@@ -98,7 +100,7 @@ run_gate() {
 
 run_stress() {
   need_ulimit
-  echo "==> C10K full-active stress (informational, --soft): clients=$CLIENTS"
+  echo "==> C10K full-active stress (informational, --soft): clients=$CLIENTS pipeline=$PIPELINE"
   "$ROOT/target/release/rudis-bench" \
     --host "$HOST" \
     --port "$PORT" \
@@ -108,6 +110,7 @@ run_stress() {
     --get-ratio 0.8 \
     --keys "$CLIENTS" \
     --connect-batch 500 \
+    --pipeline "$PIPELINE" \
     --soft \
     --p99-ms 5 || true
 }
