@@ -1,3 +1,12 @@
+> ## ⚠️ 此 repository 已退役（2026-09-04）
+>
+> 內容已遷移至 [`newclear`](https://github.com/fallrising/newclear) 的 [`systems/snail`](https://github.com/fallrising/newclear/tree/main/systems/snail)。
+>
+> 本 repository 保留為**唯讀歷史存放地**——完整 git 歷史仍在此處,
+> 但新的開發請至後繼者。
+
+---
+
 # rudis
 
 Rust in-memory **Redis-compatible** server speaking **RESP2 over TCP**.
